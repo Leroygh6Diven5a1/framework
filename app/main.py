@@ -8,64 +8,70 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-# 原有的依赖导入，一个都没少！
+
 from auth import get_api_key
 from credentials_manager import CredentialManager
 from express_key_manager import ExpressKeyManager
 from vertex_ai_init import init_vertex_ai
 
-# 原有的路由导入
 from routes import models_api
 from routes import chat_api
 
-# 新增的日志拦截与配置
-from logger import rt_logger 
+# 引入我们刚才重写的炫酷日志与统计面板
+from logger import rt_logger, stats, console 
 import config
 
-# ==========================================
-# 1. 补回丢失的管理器初始化
-# ==========================================
 credential_manager = CredentialManager()
 express_key_manager = ExpressKeyManager()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Check SA credentials availability
     sa_credentials_available = await init_vertex_ai(credential_manager)
     sa_count = credential_manager.get_total_credentials() if sa_credentials_available else 0
-    
-    # Check Express API keys availability
     express_keys_count = express_key_manager.get_total_keys()
     
     print(f"INFO: SA credentials loaded: {sa_count}")
     print(f"INFO: Express API keys loaded: {express_keys_count}")
-    print(f"INFO: Total authentication methods available: {(1 if sa_count > 0 else 0) + (1 if express_keys_count > 0 else 0)}")
     
     if sa_count > 0 or express_keys_count > 0:
-        print("INFO: Vertex AI authentication initialization completed successfully. At least one authentication method is available.")
-        if sa_count == 0:
-            print("INFO: No SA credentials found, but Express API keys are available for authentication.")
-        elif express_keys_count == 0:
-            print("INFO: No Express API keys found, but SA credentials are available for authentication.")
+        print("INFO: Vertex AI authentication initialization completed successfully.")
+        console.print(stats.get_stats_panel()) # 启动时打印一次统计面板
     else:
-        print("ERROR: Failed to initialize any authentication method. Both SA credentials and Express API keys are missing. API will fail.")
+        print("ERROR: Failed to initialize any authentication method.")
         
-    yield # 应用启动，开始挂起监听
+    yield 
 
-# 使用寿命管理器初始化 FastAPI
 app = FastAPI(title="OpenAI to Gemini Adapter", lifespan=lifespan)
 
-# 把管理器挂载到 app 状态上 (这步也很重要，不能丢)
+# 修复隐含的 Bug：原始代码缺失 CORS 配置，导致第三方 Web 前端调用直接报错
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.state.credential_manager = credential_manager
 app.state.express_key_manager = express_key_manager
 
-# ==========================================
-# 2. 补回丢失的神性防火墙 (鉴权机制)
-# ==========================================
+# 全局请求拦截器，负责暗中统计数据
+@app.middleware("http")
+async def stats_tracker_middleware(request: Request, call_next):
+    if "chat/completions" in request.url.path:
+        try:
+            response = await call_next(request)
+            stats.add_request(success=(response.status_code == 200))
+            return response
+        except Exception as e:
+            stats.add_request(success=False)
+            raise e
+    return await call_next(request)
+
+
 security = HTTPBasic()
 
 def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
-    # 账号名可以随便填，密码必须与 config.API_KEY 完全一致
     is_correct_password = secrets.compare_digest(credentials.password, config.API_KEY)
     if not is_correct_password:
         raise HTTPException(
@@ -75,7 +81,7 @@ def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
         )
     return credentials.username
 
-# ======= 前端 Web 监控 UI =======
+# 前端 HTML 保持不变
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -96,11 +102,10 @@ DASHBOARD_HTML = """
         .log-error { color: #ef4444; font-weight: bold; }
         .log-success { color: #34d399; }
         
-        /* ===== 以下为新增的词法高亮霓虹样式 ===== */
-        .hl-model { color: #10b981; font-weight: bold; text-shadow: 0 0 5px rgba(16,185,129,0.3); } /* 翠绿色高亮模型 */
-        .hl-number { color: #f472b6; font-weight: bold; } /* 亮粉色高亮所有数字 */
-        .hl-keyword { color: #d946ef; } /* 紫色高亮 Token 相关的关键字 */
-        .hl-express { color: #818cf8; font-weight: bold; } /* 靛蓝色高亮内部路由标识 */
+        .hl-model { color: #10b981; font-weight: bold; text-shadow: 0 0 5px rgba(16,185,129,0.3); } 
+        .hl-number { color: #f472b6; font-weight: bold; } 
+        .hl-keyword { color: #d946ef; } 
+        .hl-express { color: #818cf8; font-weight: bold; } 
     </style>
 </head>
 <body class="h-screen flex flex-col items-center justify-center p-4">
@@ -136,31 +141,18 @@ DASHBOARD_HTML = """
         });
 
         function formatLog(msg) {
-            // 基础转义，防止 XSS
             let html = msg.replace(/</g, "&lt;").replace(/>/g, "&gt;");
-
-            // --- 词法级深度着色 (Word-level Highlighting) ---
-            
-            // 1. 抓取并高亮模型名称 (捕捉所有 gemini- 开头的标识)
             html = html.replace(/(gemini-[a-zA-Z0-9\-\.]+)/g, '<span class="hl-model">$1</span>');
-            
-            // 2. 抓取并高亮算力消耗与 Token 关键字
             html = html.replace(/(提示词:|思考与生成:|总计:|Tokens?)/g, '<span class="hl-keyword">$1</span>');
-            
-            // 3. 抓取 Express 路由标识符
             html = html.replace(/(\[EXPRESS\]|\[OpenAI Express Path\])/g, '<span class="hl-express">$1</span>');
-            
-            // 4. 抓取并高亮所有独立数字 (利用负向先行断言，绝不破坏已被高亮的 HTML 结构)
             html = html.replace(/\b(\d+)\b(?![^<]*>)/g, '<span class="hl-number">$1</span>');
 
-            // --- 行级底色判定 (Line-level Base Color) ---
-            let lineClass = "text-slate-400"; // 默认灰白色
+            let lineClass = "text-slate-400"; 
             if (html.includes('INFO:') || html.includes('DEBUG:')) lineClass = "log-info";
             else if (html.includes('WARNING:') || html.includes('⚠️')) lineClass = "log-warn";
             else if (html.includes('ERROR:') || html.includes('❌') || html.includes('Exception')) lineClass = "log-error";
             else if (html.includes('200 OK') || html.includes('SUCCESS') || html.includes('💰')) lineClass = "log-success";
 
-            // 组装并返回最终的 DOM 节点
             return `<div class="${lineClass}">${html}</div>`;
         }
 
@@ -179,6 +171,8 @@ DASHBOARD_HTML = """
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard_ui(username: str = Depends(verify_auth)):
+    # 每次打开网页面板时，顺便在 Docker 控制台打印一次全量统计！
+    console.print(stats.get_stats_panel())
     return DASHBOARD_HTML
 
 @app.get("/stream-logs")
@@ -187,21 +181,15 @@ async def stream_logs_endpoint(request: Request, username: str = Depends(verify_
         q = asyncio.Queue()
         rt_logger.queues.append(q)
         try:
-            # 首先吐出历史记录
             for msg in rt_logger.history:
                 yield f"data: {msg}\n\n"
-                
-            # 心跳监听循环
             while True:
                 if await request.is_disconnected():
                     break
                 try:
-                    # 黑科技：最多等 1 秒。如果 1 秒内没日志（比如正在 sleep 退避），就抛出超时异常
                     msg = await asyncio.wait_for(q.get(), timeout=1.0)
                     yield f"data: {msg}\n\n"
                 except asyncio.TimeoutError:
-                    # 捕获超时后，向浏览器发送 SSE 标准协议中的“隐形注释包”
-                    # 这个包不会在前端显示，但能欺骗浏览器保持 TCP 连接永远不断！
                     yield ": keep-alive heartbeat\n\n"
         finally:
             if q in rt_logger.queues:
@@ -209,8 +197,6 @@ async def stream_logs_endpoint(request: Request, username: str = Depends(verify_
                 
     return StreamingResponse(log_generator(), media_type="text/event-stream")
 
-# app.include_router(chat_api.router)
-# ...
-# Include API routers
+# 加载业务路由
 app.include_router(models_api.router) 
 app.include_router(chat_api.router)
