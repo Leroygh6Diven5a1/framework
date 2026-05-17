@@ -20,16 +20,17 @@ from message_processing import (
     _create_safety_ratings_html
 )
 import config as app_config
-from config import VERTEX_REASONING_TAG
+
+# 引入报错统计器，统计拦截和重试
+from logger import stats
 
 class StreamingReasoningProcessor:
-    def __init__(self, tag_name: str = VERTEX_REASONING_TAG):
-        self.tag_name = tag_name
-        self.open_tag = f"<{tag_name}>"
-        self.close_tag = f"</{tag_name}>"
+    def __init__(self):
+        # 强制使用标准的 think 标签
+        self.open_tag = "<think>"
+        self.close_tag = "</think>"
         self.tag_buffer = ""
         self.inside_tag = False
-        self._reasoning_chunks = [] # 使用列表来缓存，比字符串拼接性能高
         self.partial_tag_buffer = "" 
 
     def process_chunk(self, content: str) -> tuple[str, str]:
@@ -73,8 +74,7 @@ class StreamingReasoningProcessor:
                             partial_match = True
                             if len(self.tag_buffer) > i:
                                 new_reasoning = self.tag_buffer[:-i]
-                                self._reasoning_chunks.append(new_reasoning)
-                                if new_reasoning: current_reasoning_chunks.append(new_reasoning)
+                                current_reasoning_chunks.append(new_reasoning)
                                 self.partial_tag_buffer = self.tag_buffer[-i:]
                             else: 
                                 self.partial_tag_buffer = self.tag_buffer
@@ -82,13 +82,11 @@ class StreamingReasoningProcessor:
                             break
                     if not partial_match:
                         if self.tag_buffer:
-                            self._reasoning_chunks.append(self.tag_buffer)
                             current_reasoning_chunks.append(self.tag_buffer)
                             self.tag_buffer = ""
                     break
                 else:
                     final_reasoning_chunk = self.tag_buffer[:close_pos]
-                    self._reasoning_chunks.append(final_reasoning_chunk)
                     if final_reasoning_chunk: current_reasoning_chunks.append(final_reasoning_chunk)
                     
                     self.tag_buffer = self.tag_buffer[close_pos + len(self.close_tag):]
@@ -97,24 +95,25 @@ class StreamingReasoningProcessor:
         return "".join(processed_content_chunks), "".join(current_reasoning_chunks)
     
     def flush_remaining(self) -> tuple[str, str]:
-        remaining_content_chunks = []
+        # 彻底抛弃历史记录累加！只冲刷遗留缓冲区，防止前端显示两次
+        remaining_content = ""
+        remaining_reasoning = ""
+        
         if self.partial_tag_buffer:
-            remaining_content_chunks.append(self.partial_tag_buffer)
+            if self.inside_tag:
+                remaining_reasoning += self.partial_tag_buffer
+            else:
+                remaining_content += self.partial_tag_buffer
             self.partial_tag_buffer = ""
             
-        if not self.inside_tag:
-            if self.tag_buffer: remaining_content_chunks.append(self.tag_buffer)
-        else:
-            # 修复：未闭合的标签内容应归属思考块，而不是正文！
-            if self.tag_buffer: self._reasoning_chunks.append(self.tag_buffer)
-            self.inside_tag = False
+        if self.tag_buffer:
+            if self.inside_tag:
+                remaining_reasoning += self.tag_buffer
+            else:
+                remaining_content += self.tag_buffer
+            self.tag_buffer = ""
             
-        remaining_content = "".join(remaining_content_chunks)
-        remaining_reasoning = "".join(self._reasoning_chunks)
-        
-        self.tag_buffer = ""
-        self._reasoning_chunks.clear()
-        
+        self.inside_tag = False
         return remaining_content, remaining_reasoning
     
 
@@ -142,6 +141,8 @@ def is_retryable_exception(e):
 def log_retry_attempt(retry_state):
     attempt = retry_state.attempt_number
     e = retry_state.outcome.exception()
+    # 【打通仪表盘】：每一次 Google 的拦截或重试都会被记录为错误！
+    stats.add_request(success=False)
     print(f"⚠️ 触发神性护盾 (API {e.__class__.__name__}): 遇到速率限制或异常。正在进行第 {attempt} 次自动重试...")
 
 @retry(
@@ -155,8 +156,8 @@ async def execute_with_retry(func, *args, **kwargs):
         return await func(*args, **kwargs)
     except Exception as e:
         if not is_retryable_exception(e):
-            raise e # 如果不是429这类可以重试的错误，立刻抛出，中止重试
-        raise # 如果是，抛出给 tenacity 让它进行完美的指数退避重试
+            raise e 
+        raise 
     
 def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     config: Dict[str, Any] = {}
@@ -191,7 +192,6 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     safety_method = "PROBABILITY"
     
     config["safety_settings"] = [
-            # 必须完整保留 11 个类别，防止系统静默重置图像安全阈值
             types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold=safety_threshold, method=safety_method),
             types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold=safety_threshold, method=safety_method),
             types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold=safety_threshold, method=safety_method),
@@ -247,7 +247,6 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     if tool_config: config["tool_config"] = tool_config
         
     return config
-
 
 def is_gemini_response_valid(response: Any) -> bool:
     if response is None: return False
@@ -365,7 +364,6 @@ async def gemini_fake_stream_generator(
     try:
         raw_gemini_response = await api_call_task 
         
-        # [拦截假流式 Token]
         if hasattr(raw_gemini_response, 'usage_metadata') and raw_gemini_response.usage_metadata:
             um = raw_gemini_response.usage_metadata
             p_tk = getattr(um, 'prompt_token_count', 0) or 0
@@ -391,13 +389,8 @@ async def gemini_fake_stream_generator(
 
     except asyncio.CancelledError:
         print(f"INFO: Client disconnected during Fake Stream (Gemini: {request_obj.model}). Cleaning up.")
-        
-        # === 加入本小姐的协程斩杀剑 ===
         if 'api_call_task' in locals() and not api_call_task.done():
             api_call_task.cancel()
-            print("INFO: 成功斩杀后台挂起的 Gemini API 请求！防止算力泄漏。")
-        # =============================
-        
         raise
     except Exception as e_outer_gemini:
         err_msg_detail = f"Error in gemini_fake_stream_generator (model: '{request_obj.model}'): {type(e_outer_gemini).__name__} - {str(e_outer_gemini)}"
@@ -461,7 +454,7 @@ async def openai_fake_stream_generator(
                 choice_message_ref = first_choice_dict_item.get("message", {})
                 original_content = choice_message_ref.get("content")
                 if isinstance(original_content, str):
-                    reasoning_text, actual_content = extract_reasoning_by_tags(original_content, VERTEX_REASONING_TAG)
+                    reasoning_text, actual_content = extract_reasoning_by_tags(original_content, "think")
                     choice_message_ref["content"] = actual_content
                     if reasoning_text:
                         choice_message_ref["reasoning_content"] = reasoning_text
@@ -475,13 +468,8 @@ async def openai_fake_stream_generator(
             
     except asyncio.CancelledError:
         print(f"INFO: Client disconnected during Fake Stream (OpenAI: {request_obj.model}). Cleaning up.")
-        
-        # === 加入本小姐的协程斩杀剑 ===
         if 'api_call_task' in locals() and not api_call_task.done():
             api_call_task.cancel()
-            print("INFO: 成功斩杀后台挂起的 OpenAI Direct API 请求！防止算力泄漏。")
-        # =============================
-        
         raise
     except Exception as e_outer: 
         err_msg_detail = f"Error in openai_fake_stream_generator (model: '{request_obj.model}'): {type(e_outer).__name__} - {str(e_outer)}"
@@ -522,21 +510,17 @@ async def execute_gemini_call(
         else: # True Streaming
             response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
             async def _gemini_real_stream_generator_inner():
-                # [核心修复]: 为原生 SDK 注入全包裹式的 20 次波浪退避护盾！
                 max_retries = 20
                 for attempt in range(max_retries):
                     try:
-                        # 惰性调用：此时可能不报错
                         stream_gen_obj = await current_client.aio.models.generate_content_stream(
                             model=model_to_call, 
                             contents=actual_prompt_for_call,
                             config=gen_config_dict
                         )
                         
-                        # 初始化 Token 计数器，移至循环外防止多次打印累加
                         final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
                         
-                        # 真正的深水区：在这里迭代时随时会引爆 429
                         async for chunk_item_call in stream_gen_obj:
                             if hasattr(chunk_item_call, 'usage_metadata') and chunk_item_call.usage_metadata:
                                 um = chunk_item_call.usage_metadata
@@ -546,7 +530,6 @@ async def execute_gemini_call(
                                     
                             yield convert_chunk_to_openai(chunk_item_call, request_obj.model, response_id_for_stream, 0)
                         
-                        # 顺利迭代完毕，统一打印最终算力消耗
                         if final_p_tk > 0 or final_c_tk > 0:
                             print(f"💰 [算力消耗] 提示词: {final_p_tk} | 模型思考与生成: {final_c_tk} | 总计: {final_t_tk} Tokens")
                             
@@ -560,7 +543,6 @@ async def execute_gemini_call(
                         error_str = str(e_stream_call).lower()
                         is_retryable = False
                         
-                        # 极速嗅探网络堵塞与算力拒绝
                         if "429" in error_str or "503" in error_str or "too many requests" in error_str or "quota" in error_str or "resource exhausted" in error_str:
                             is_retryable = True
                             
@@ -570,9 +552,8 @@ async def execute_gemini_call(
                             wait_time = 2 ** wave_index
                             print(f"⚠️ [Gemini SDK Stream] 遭遇算力天花板/速率限制. 第 {round_num} 轮/第 {wave_index + 1} 次护盾激活，等待 {wait_time}s 后重试...")
                             await asyncio.sleep(wait_time)
-                            continue # 进入深层休眠，随后重试
+                            continue 
                             
-                        # 如果不是 429 或者是死局，向下传递死亡通知
                         err_msg_detail_stream = f"Streaming Error (Gemini API, model string: '{model_to_call}'): {type(e_stream_call).__name__} - {str(e_stream_call)}"
                         print(f"ERROR: {err_msg_detail_stream}")
                         s_err = str(e_stream_call); s_err = s_err[:1024]+"..." if len(s_err)>1024 else s_err
@@ -622,7 +603,6 @@ async def execute_gemini_call(
                 error_details += f"Response type: {type(response_obj_call).__name__}"
             raise ValueError(error_details)
         
-        # [拦截非流式 Token]
         if hasattr(response_obj_call, 'usage_metadata') and response_obj_call.usage_metadata:
             um = response_obj_call.usage_metadata
             p_tk = getattr(um, 'prompt_token_count', 0) or 0

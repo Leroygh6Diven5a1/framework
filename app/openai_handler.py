@@ -25,9 +25,7 @@ from credentials_manager import _refresh_auth
 from project_id_discovery import discover_project_id
 
 
-# Wrapper classes to mimic OpenAI SDK responses for direct httpx calls
 class FakeChatCompletionChunk:
-    """A fake ChatCompletionChunk to wrap the dictionary from a direct API stream."""
     def __init__(self, data: Dict[str, Any]):
         self._data = data
 
@@ -35,7 +33,6 @@ class FakeChatCompletionChunk:
         return self._data
 
 class FakeChatCompletion:
-    """A fake ChatCompletion to wrap the dictionary from a direct non-streaming API call."""
     def __init__(self, data: Dict[str, Any]):
         self._data = data
 
@@ -43,23 +40,16 @@ class FakeChatCompletion:
         return self._data
 
 class ExpressClientWrapper:
-    """
-    A wrapper that mimics the openai.AsyncOpenAI client interface but uses direct
-    httpx calls for Vertex AI Express Mode. This allows it to be used with the
-    existing response handling logic.
-    """
     def __init__(self, project_id: str, api_key: str, location: str = "global"):
         self.project_id = project_id
         self.api_key = api_key
         self.location = location
         self.base_url = f"https://aiplatform.googleapis.com/v1beta1/projects/{self.project_id}/locations/{self.location}/endpoints/openapi"
         
-        # The 'chat.completions' structure mimics the real OpenAI client
         self.chat = self
         self.completions = self
 
     async def _stream_generator(self, response: httpx.Response) -> AsyncGenerator[FakeChatCompletionChunk, None]:
-        """Generates stream chunks from the httpx response with strict Type-Safe Token sniffing."""
         final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
         async for line in response.aiter_lines():
             if not line:
@@ -73,7 +63,6 @@ class ExpressClientWrapper:
                     
                 try:
                     data = json.loads(json_str)
-                    # 动态捕获 Token 消耗，不立刻打印，留到最后
                     if isinstance(data, dict) and "usage" in data and data["usage"]:
                         usage = data["usage"]
                         final_p_tk = usage.get("prompt_tokens", 0)
@@ -85,12 +74,10 @@ class ExpressClientWrapper:
                 except json.JSONDecodeError:
                     continue
         
-        # 将 Token 打印外置，流结束时只打印一次，防止疯狂累加
         if final_p_tk > 0 or final_c_tk > 0:
             print(f"💰 [算力消耗] 提示词: {final_p_tk} | 模型思考与生成: {final_c_tk} | 总计: {final_t_tk} Tokens")
             
     async def _streaming_create(self, **kwargs) -> AsyncGenerator[FakeChatCompletionChunk, None]:
-        """Handles the creation of a streaming request using httpx with built-in retry."""
         endpoint = f"{self.base_url}/chat/completions"
         headers = {"Content-Type": "application/json"}
         params = {"key": self.api_key}
@@ -99,7 +86,6 @@ class ExpressClientWrapper:
         if 'extra_body' in payload:
             payload.update(payload.pop('extra_body'))
 
-        # 强制包含 Token 消耗流
         payload["stream_options"] = {"include_usage": True}
 
         proxies = None
@@ -135,13 +121,11 @@ class ExpressClientWrapper:
                     raise e
 
     async def create(self, **kwargs) -> Any:
-        """Mimics the 'create' method of the OpenAI client with built-in retry."""
         is_streaming = kwargs.get("stream", False)
 
         if is_streaming:
             return self._streaming_create(**kwargs)
         
-        # Non-streaming logic
         endpoint = f"{self.base_url}/chat/completions"
         headers = {"Content-Type": "application/json"}
         params = {"key": self.api_key}
@@ -181,13 +165,11 @@ class ExpressClientWrapper:
                     raise e
     
 class OpenAIDirectHandler:
-    """Handles OpenAI Direct mode operations including client creation and response processing."""
     
     def __init__(self, credential_manager=None, express_key_manager=None):
         self.credential_manager = credential_manager
         self.express_key_manager = express_key_manager
         
-        # 设定高门槛拦截与概率评估法
         safety_threshold = "BLOCK_NONE"
         safety_method = "PROBABILITY"
         
@@ -204,7 +186,6 @@ class OpenAIDirectHandler:
         ]
 
     def create_openai_client(self, project_id: str, gcp_token: str, location: str = "global") -> openai.AsyncOpenAI:
-        """Create an OpenAI client configured for Vertex AI endpoint."""
         endpoint_url = (
             f"https://aiplatform.googleapis.com/v1beta1/"
             f"projects/{project_id}/locations/{location}/endpoints/openapi"
@@ -226,15 +207,11 @@ class OpenAIDirectHandler:
         http_client = httpx.AsyncClient(**client_args) if client_args else None
         return openai.AsyncOpenAI(
             base_url=endpoint_url,
-            api_key=gcp_token,  # OAuth token
+            api_key=gcp_token, 
             http_client=http_client,
         )
     
     def prepare_openai_params(self, request: OpenAIRequest, model_id: str, is_openai_search: bool = False) -> Dict[str, Any]:
-        """
-        Prepare parameters for OpenAI API call by converting the request to a dictionary,
-        and then overriding the model. This is more robust than manually picking parameters.
-        """
         params = request.model_dump(exclude_unset=True)
         params['model'] = model_id
         
@@ -247,12 +224,11 @@ class OpenAIDirectHandler:
         return openai_params
     
     def prepare_extra_body(self) -> Dict[str, Any]:
-        """Prepare extra body parameters for OpenAI API call with strict CamelCase for Google."""
+        # 移除了干扰性的 thoughtTagMarker，强迫其使用原生的 <think>
         return {
             "extra_body": {
                 'google': {
                     'safetySettings': self.safety_settings,
-                    'thoughtTagMarker': VERTEX_REASONING_TAG,
                     "thinkingConfig": {
                         "includeThoughts": True
                     }
@@ -262,14 +238,12 @@ class OpenAIDirectHandler:
     
     async def handle_streaming_response(
         self,
-        openai_client: Any, # Can be openai.AsyncOpenAI or our wrapper
+        openai_client: Any, 
         openai_params: Dict[str, Any],
         openai_extra_body: Dict[str, Any],
         request: OpenAIRequest
     ) -> StreamingResponse:
-        """Handle streaming responses for OpenAI Direct mode."""
         if app_config.FAKE_STREAMING_ENABLED:
-            print(f"INFO: OpenAI Fake Streaming (SSE Simulation) ENABLED for model '{request.model}'.")
             return StreamingResponse(
                 openai_fake_stream_generator(
                     openai_client=openai_client,
@@ -281,7 +255,6 @@ class OpenAIDirectHandler:
                 media_type="text/event-stream"
             )
         else:
-            print(f"INFO: OpenAI True Streaming ENABLED for model '{request.model}'.")
             return StreamingResponse(
                 self._true_stream_generator(openai_client, openai_params, openai_extra_body, request),
                 media_type="text/event-stream"
@@ -294,7 +267,6 @@ class OpenAIDirectHandler:
         openai_extra_body: Dict[str, Any],
         request: OpenAIRequest
     ) -> AsyncGenerator[str, None]:
-        """Generate true streaming response."""
         try:
             openai_params_for_stream = {**openai_params, "stream": True}
             
@@ -304,7 +276,7 @@ class OpenAIDirectHandler:
                 extra_body=openai_extra_body
             )
             
-            reasoning_processor = StreamingReasoningProcessor(VERTEX_REASONING_TAG)
+            reasoning_processor = StreamingReasoningProcessor()
             
             async for chunk in stream_response:
                 try:
@@ -376,7 +348,6 @@ class OpenAIDirectHandler:
                     yield "data: [DONE]\n\n"
                     return
             
-            # 流式结束时，冲刷并吐出缓冲区中由于切割而遗留的思考标签和正文内容
             remaining_content, remaining_reasoning = reasoning_processor.flush_remaining()
             
             if remaining_reasoning:
@@ -431,7 +402,6 @@ class OpenAIDirectHandler:
         openai_extra_body: Dict[str, Any],
         request: OpenAIRequest
     ) -> JSONResponse:
-        """Handle non-streaming responses for OpenAI Direct mode."""
         try:
             openai_params_non_stream = {**openai_params, "stream": False}
             
@@ -454,8 +424,8 @@ class OpenAIDirectHandler:
                         actual_content = full_content if isinstance(full_content, str) else ""
                         
                         if actual_content:
-                            # 提取思考内容，并将其从正文中剥离
-                            reasoning_text, actual_content = extract_reasoning_by_tags(actual_content, VERTEX_REASONING_TAG)
+                            # 固定为提取 think 标签
+                            reasoning_text, actual_content = extract_reasoning_by_tags(actual_content, "think")
                             message_dict['content'] = actual_content
                             if reasoning_text:
                                 message_dict['reasoning_content'] = reasoning_text
@@ -476,7 +446,6 @@ class OpenAIDirectHandler:
             )
     
     async def process_request(self, request: OpenAIRequest, base_model_name: str, is_express: bool = False, is_openai_search: bool = False):
-        """Main entry point for processing OpenAI Direct mode requests."""
         print(f"INFO: Using OpenAI Direct Path for model: {request.model} (Express: {is_express})")
         
         client: Any = None 
