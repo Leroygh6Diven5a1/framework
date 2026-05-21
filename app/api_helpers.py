@@ -4,7 +4,8 @@ import math
 import asyncio
 import httpx
 import re
-import random  # 【核心修复】：补齐确实的 random 库，防止生成工具 ID 时报 NameError
+import random 
+import base64  # 【核心导入】用于签名二进制编解码
 from typing import List, Dict, Any, Callable, Union, Optional
 
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -342,14 +343,29 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                 if hasattr(part, 'function_call') and part.function_call is not None: 
                     fc = part.function_call
                     
-                    # 提取流式传输中的原生 thought_signature
+                    # ---- 📦【打包 thought_signature】（打字机流式输出的核心修复）----
                     real_id = getattr(fc, 'id', None)
                     if not real_id: real_id = getattr(fc, 'thought_signature', None)
                     
+                    # 拦截流式输出中 Part 携带的 thought_signature 二进制字节流并编码
+                    thought_sig = getattr(part, 'thought_signature', None)
+                    thought_sig_b64 = ""
+                    if thought_sig:
+                        if isinstance(thought_sig, bytes):
+                            thought_sig_b64 = base64.b64encode(thought_sig).decode('utf-8')
+                        elif isinstance(thought_sig, str):
+                            thought_sig_b64 = thought_sig
+                    
                     if real_id:
-                        tool_call_id = real_id
+                        if thought_sig_b64:
+                            tool_call_id = f"{real_id}__thought__{thought_sig_b64}"
+                        else:
+                            tool_call_id = real_id
                     else:
-                        tool_call_id = f"call_{response_id}_{candidate_index}_{fc.name.replace(' ', '_')}_{int(time.time()*10000 + random.randint(0,9999))}"
+                        if thought_sig_b64:
+                            tool_call_id = f"call_{response_id}_{candidate_index}_{fc.name.replace(' ', '_')}__thought__{thought_sig_b64}"
+                        else:
+                            tool_call_id = f"call_{response_id}_{candidate_index}_{fc.name.replace(' ', '_')}_{int(time.time()*10000 + random.randint(0,9999))}"
                     
                     current_tool_call_delta = {
                         "index": 0, 
@@ -723,28 +739,4 @@ async def execute_gemini_call(
             if hasattr(response_obj_call, 'candidates'):
                 error_details += f"Candidates: {len(response_obj_call.candidates) if response_obj_call.candidates else 0}. "
                 if response_obj_call.candidates and len(response_obj_call.candidates) > 0:
-                    candidate = response_obj_call.candidates if isinstance(response_obj_call.candidates, list) else response_obj_call.candidates
-                    if hasattr(candidate, 'content'):
-                        error_details += "Has content. "
-                        if hasattr(candidate.content, 'parts'):
-                            error_details += f"Parts: {len(candidate.content.parts) if candidate.content.parts else 0}. "
-                            if candidate.content.parts and len(candidate.content.parts) > 0:
-                                part = candidate.content.parts if isinstance(candidate.content.parts, list) else candidate.content.parts
-                                if hasattr(part, 'text'):
-                                    text_preview = str(getattr(part, 'text', ''))[:100]
-                                    error_details += f"First part text: '{text_preview}'"
-                                elif hasattr(part, 'function_call'):
-                                    error_details += f"First part is function_call: {part.function_call.name}"
-            else:
-                error_details += f"Response type: {type(response_obj_call).__name__}"
-            raise ValueError(error_details)
-        
-        if hasattr(response_obj_call, 'usage_metadata') and response_obj_call.usage_metadata:
-            um = response_obj_call.usage_metadata
-            p_tk = getattr(um, 'prompt_token_count', 0) or 0
-            c_tk = getattr(um, 'candidates_token_count', 0) or 0
-            t_tk = getattr(um, 'total_token_count', p_tk + c_tk) or (p_tk + c_tk)
-            print(f"💰 [算力消耗] 提示词: {p_tk} | 模型思考与生成: {c_tk} | 总计: {t_tk} Tokens")
-
-        openai_response_content = convert_to_openai_format(response_obj_call, request_obj.model)
-        return JSONResponse(content=openai_response_content)
+                    candidate = response_obj_call.candidates if isinstance(response_obj_call.candida

@@ -26,35 +26,24 @@ def extract_reasoning_by_tags(full_text: str, tag_name: str) -> Tuple[str, str]:
     return reasoning_content.strip(), normal_text.strip()
 
 def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]:
-    """
-    Extract markdown images from text and convert them to Gemini Parts.
-    Returns a tuple of (image_parts, text_without_images)
-    """
     parts = []
     remaining_text = text
-    
-    # Pattern to match markdown images with data URLs
     pattern = r'!\[[^\]]*\]\(data:(image/[a-zA-Z0-9+.-]+);base64,([a-zA-Z0-9+/=]+)\)'
-    
     matches = list(re.finditer(pattern, text))
     
     if matches:
         for match in reversed(matches):
             mime_type = match.group(1)
             b64_data = match.group(2)
-            
             if not mime_type.startswith('image/'):
                 continue
-            
             try:
                 image_bytes = base64.b64decode(b64_data)
                 parts.append(types.Part.from_bytes(data=image_bytes, mime_type=mime_type))
-                
                 start, end = match.span()
                 remaining_text = remaining_text[:start] + remaining_text[end:]
             except Exception as e:
                 print(f"Error extracting markdown image: {e}")
-        
         parts.reverse()
     
     remaining_text = re.sub(r'[ \t]+', ' ', remaining_text).strip()
@@ -84,19 +73,36 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                 except json.JSONDecodeError:
                     tool_output_data = {"result": str(message.content)}
 
-                # 【防 400 核心修复】：使用 kwargs 硬注入 id，避免 Pydantic 拦截
+                # ---- 🔄【解包 thought_signature】 极其关键的步骤 ----
+                tool_call_id_str = message.tool_call_id or ""
+                thought_sig_bytes = None
+                real_tool_id = tool_call_id_str
+
+                if "__thought__" in tool_call_id_str:
+                    parts_id = tool_call_id_str.split("__thought__")
+                    real_tool_id = parts_id[0]
+                    b64_sig = parts_id[1]
+                    try:
+                        thought_sig_bytes = base64.b64decode(b64_sig)
+                    except Exception:
+                        pass
+
                 func_resp_kwargs = {
                     "name": message.name,
                     "response": tool_output_data,
                 }
-                if message.tool_call_id:
-                    func_resp_kwargs["id"] = message.tool_call_id
+                if real_tool_id:
+                    func_resp_kwargs["id"] = real_tool_id
                     
                 try:
-                    # 原生构造函数注入，确保底层生成标准的 JSON 序列化
-                    resp_part = types.Part(function_response=types.FunctionResponse(**func_resp_kwargs))
+                    part_kwargs = {
+                        "function_response": types.FunctionResponse(**func_resp_kwargs)
+                    }
+                    if thought_sig_bytes:
+                        part_kwargs["thought_signature"] = thought_sig_bytes
+                    resp_part = types.Part(**part_kwargs)
                 except Exception as e:
-                    print(f"Warning: Failed to inject FunctionResponse ID: {e}")
+                    print(f"Warning: Failed to inject FunctionResponse ID or thought_signature: {e}")
                     resp_part = types.Part.from_function_response(name=message.name, response=tool_output_data)
 
                 parts.append(resp_part)
@@ -118,18 +124,36 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                     parsed_arguments = {} 
                     
                 if function_name:
-                    # 【防 400 核心修复】：历史消息回传时，硬注入 thought_signature (id)
+                    # ---- 🔄【解包 thought_signature】 极其关键的步骤 ----
+                    tool_call_id_str = tool_call_id or ""
+                    thought_sig_bytes = None
+                    real_tool_id = tool_call_id_str
+
+                    if "__thought__" in tool_call_id_str:
+                        parts_id = tool_call_id_str.split("__thought__")
+                        real_tool_id = parts_id[0]
+                        b64_sig = parts_id[1]
+                        try:
+                            thought_sig_bytes = base64.b64decode(b64_sig)
+                        except Exception:
+                            pass
+
                     fc_kwargs = {
                         "name": function_name,
                         "args": parsed_arguments
                     }
-                    if tool_call_id:
-                        fc_kwargs["id"] = tool_call_id
+                    if real_tool_id:
+                        fc_kwargs["id"] = real_tool_id
                         
                     try:
-                        fc_part = types.Part(function_call=types.FunctionCall(**fc_kwargs))
+                        part_kwargs = {
+                            "function_call": types.FunctionCall(**fc_kwargs)
+                        }
+                        if thought_sig_bytes:
+                            part_kwargs["thought_signature"] = thought_sig_bytes
+                        fc_part = types.Part(**part_kwargs)
                     except Exception as e:
-                        print(f"Warning: Failed to inject FunctionCall ID: {e}")
+                        print(f"Warning: Failed to inject FunctionCall ID or thought_signature: {e}")
                         fc_part = types.Part.from_function_call(name=function_name, args=parsed_arguments)
                         
                     parts.append(fc_part)
@@ -138,7 +162,6 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                 if isinstance(message.content, str):
                     image_parts, clean_text = _extract_markdown_images_to_parts(message.content)
                     if clean_text: parts.append(types.Part.from_text(text=clean_text))
-                    
         else: 
             if message.content is None: continue
             
@@ -349,13 +372,30 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
                     if hasattr(part, 'function_call') and part.function_call is not None: 
                         fc = part.function_call
                         
+                        # ---- 📦【打包 thought_signature】 极其关键的步骤 ----
                         real_id = getattr(fc, 'id', None)
                         if not real_id: real_id = getattr(fc, 'thought_signature', None)
                         
+                        # 同时捕获属于此 Part 的加密 thought_signature 
+                        thought_sig = getattr(part, 'thought_signature', None)
+                        thought_sig_b64 = ""
+                        if thought_sig:
+                            if isinstance(thought_sig, bytes):
+                                thought_sig_b64 = base64.b64encode(thought_sig).decode('utf-8')
+                            elif isinstance(thought_sig, str):
+                                thought_sig_b64 = thought_sig
+
+                        # 完美缝合原生签名，拼装成 OpenAI ID 返回
                         if real_id:
-                            tool_call_id = real_id
+                            if thought_sig_b64:
+                                tool_call_id = f"{real_id}__thought__{thought_sig_b64}"
+                            else:
+                                tool_call_id = real_id
                         else:
-                            tool_call_id = f"call_{base_id}_{i}_{fc.name.replace(' ', '_')}_{int(time.time()*10000 + random.randint(0,9999))}"
+                            if thought_sig_b64:
+                                tool_call_id = f"call_{base_id}_{i}_{fc.name.replace(' ', '_')}__thought__{thought_sig_b64}"
+                            else:
+                                tool_call_id = f"call_{base_id}_{i}_{fc.name.replace(' ', '_')}_{int(time.time()*10000 + random.randint(0,9999))}"
                         
                         if "tool_calls" not in message_payload:
                             message_payload["tool_calls"] = []
