@@ -65,12 +65,40 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
             
         gen_config_dict = create_generation_config(request)
 
-        # 【致命 Bug 修复】：Gemini 3 Pro Image 模型强制原生思考，它极度严苛，如果传入 thinking_config 会直接抛出 400 INVALID_ARGUMENT 崩溃！所以生图模型绝对不能传这个配置！
-        is_thinking_capable = "gemini-2.5" in base_model_name or "gemini-3" in base_model_name
+        # 【致崩 Bug 修复 / 参数优化】：
+        # Gemini 3.x / 3.5 必须使用 thinking_level 控制思考深度，坚决不能传 legacy thinking_budget。
+        # Gemini 2.5 只能使用 legacy thinking_budget，坚决不能传 thinking_level。
+        is_thinking_capable = "gemini-2.5" in base_model_name or "gemini-3" in base_model_name or "gemini-3.5" in base_model_name
+        is_gemini_2_5 = "gemini-2.5" in base_model_name
+        is_gemini_3_or_above = "gemini-3" in base_model_name or "gemini-3.5" in base_model_name
+        
+        # 提取客户端可能传入的 reasoning_effort 参数 (支持 extra_body / standard)
+        reasoning_effort = getattr(request, "reasoning_effort", None)
+        if not reasoning_effort and hasattr(request, "model_extra") and request.model_extra:
+            reasoning_effort = request.model_extra.get("reasoning_effort")
+
         if is_thinking_capable and not is_image_model:
-            if "thinking_config" not in gen_config_dict:
-                gen_config_dict["thinking_config"] = {}
-            gen_config_dict["thinking_config"]["include_thoughts"] = True
+            thinking_config = {"include_thoughts": True}
+            
+            if is_gemini_3_or_above:
+                # 适配 Gemini 3 / 3.5 代思考层级配置
+                if reasoning_effort == "low":
+                    thinking_config["thinking_level"] = "low"
+                elif reasoning_effort == "medium":
+                    thinking_config["thinking_level"] = "medium"
+                elif reasoning_effort == "high":
+                    thinking_config["thinking_level"] = "high"
+                else:
+                    thinking_config["thinking_level"] = "high" # 默认高推理深度
+                    
+            elif is_gemini_2_5:
+                # 适配 Gemini 2.5 代思考预算配置
+                if reasoning_effort == "low":
+                    thinking_config["thinking_budget"] = 1024
+                else:
+                    thinking_config["thinking_budget"] = -1 # -1 激活谷歌自动动态预算
+            
+            gen_config_dict["thinking_config"] = thinking_config
 
         client_to_use = None
 
@@ -129,8 +157,9 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
         else: 
             current_prompt_func = create_gemini_prompt
 
+            # 【Bug 优化】：统一将 Grounded Search 追加为 Dict，避免 Pydantic 实体与字典混用在 SDK 验证时触发警告
             if is_grounded_search and not is_image_model:
-                search_tool = types.Tool(google_search=types.GoogleSearch())
+                search_tool = {"google_search": {}}
                 if "tools" in gen_config_dict and isinstance(gen_config_dict["tools"], list):
                     gen_config_dict["tools"].append(search_tool)
                 else:
