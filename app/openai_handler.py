@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 import httpx
+import re
 from typing import Dict, Any, AsyncGenerator
 
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -230,16 +231,57 @@ class OpenAIDirectHandler:
             del openai_params["reasoning_effort"]
         return openai_params
     
-    def prepare_extra_body(self, base_model_name: str) -> Dict[str, Any]:
+    def prepare_extra_body(self, base_model_name: str, reasoning_effort: str = None) -> Dict[str, Any]:
         google_config = {
             "safetySettings": self.safety_settings
         }
         
-        is_pro_model = "pro" in base_model_name.lower()
-        if is_pro_model:
-            google_config["thinkingConfig"] = {
-                "includeThoughts": True
-            }
+        is_thinking_capable = False
+        is_gemini_2_5 = False
+        is_gemini_3_or_above = False
+        
+        # 兼容最新 3.x/3.5 的代系识别逻辑
+        version_match = re.search(r'gemini-(\d+)\.(\d+)|gemini-(\d+)', base_model_name.lower())
+        if version_match:
+            groups = version_match.groups()
+            major = 0
+            minor_val = 0.0
+            
+            if groups[2]:
+                major = int(groups[2])
+            elif groups[0] and groups[1]:
+                major = int(groups[0])
+                try:
+                    minor_val = float(groups[1])
+                except ValueError:
+                    pass
+            
+            if major > 2 or (major == 2 and minor_val >= 5.0):
+                is_thinking_capable = True
+            if major == 2 and minor_val == 5.0:
+                is_gemini_2_5 = True
+            elif major >= 3:
+                is_gemini_3_or_above = True
+
+        if is_thinking_capable and "image" not in base_model_name.lower():
+            thinking_config = {"includeThoughts": True}
+            
+            if is_gemini_3_or_above:
+                # 兼容 3.x 的 Level 推理强度 (注意直连通道采用驼峰命名)
+                if reasoning_effort == "low":
+                    thinking_config["thinkingLevel"] = "LOW"
+                elif reasoning_effort == "medium":
+                    thinking_config["thinkingLevel"] = "MEDIUM"
+                else:
+                    thinking_config["thinkingLevel"] = "HIGH"
+            elif is_gemini_2_5:
+                # 兼容 2.5 的 Budget 预算强度
+                if reasoning_effort == "low":
+                    thinking_config["thinkingBudget"] = 1024
+                else:
+                    thinking_config["thinkingBudget"] = -1
+                    
+            google_config["thinkingConfig"] = thinking_config
             
         return {
             "extra_body": {
@@ -279,7 +321,6 @@ class OpenAIDirectHandler:
         request: OpenAIRequest
     ) -> AsyncGenerator[str, None]:
         try:
-            # 【Bug 修复】：注入 include_usage，确保 OpenAI 直连流输出最后一个 chunk 能够成功吐出 usage 指标
             openai_params_for_stream = {
                 **openai_params, 
                 "stream": True,
@@ -509,9 +550,14 @@ class OpenAIDirectHandler:
                 client = self.create_openai_client(rotated_project_id, gcp_token)
 
             model_id = f"google/{base_model_name}"
-            openai_params = self.prepare_openai_params(request, model_id, is_openai_search)
             
-            openai_extra_body = self.prepare_extra_body(base_model_name)
+            # 提取 reasoning_effort 参数
+            reasoning_effort = getattr(request, "reasoning_effort", None)
+            if not reasoning_effort and hasattr(request, "model_extra") and request.model_extra:
+                reasoning_effort = request.model_extra.get("reasoning_effort")
+                
+            openai_params = self.prepare_openai_params(request, model_id, is_openai_search)
+            openai_extra_body = self.prepare_extra_body(base_model_name, reasoning_effort)
             
             if request.stream:
                 return await self.handle_streaming_response(
