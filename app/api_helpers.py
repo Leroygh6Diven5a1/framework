@@ -204,22 +204,17 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
         if fmt_type == "json_object":
             config["response_mime_type"] = "application/json"
     
+    # 官方 2026 最新基准配置：废弃了政治项，正式加入了 JAILBREAK
     safety_threshold = "BLOCK_NONE"
-    safety_method = "PROBABILITY"
     
     config["safety_settings"] = [
-            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold=safety_threshold, method=safety_method),
-            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold=safety_threshold, method=safety_method),
-            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold=safety_threshold, method=safety_method),
-            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold=safety_threshold, method=safety_method),
-            types.SafetySetting(category="HARM_CATEGORY_CIVIC_INTEGRITY", threshold=safety_threshold, method=safety_method),
-            types.SafetySetting(category="HARM_CATEGORY_IMAGE_HATE", threshold=safety_threshold, method=safety_method),
-            types.SafetySetting(category="HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT", threshold=safety_threshold, method=safety_method),
-            types.SafetySetting(category="HARM_CATEGORY_IMAGE_HARASSMENT", threshold=safety_threshold, method=safety_method),
-            types.SafetySetting(category="HARM_CATEGORY_IMAGE_SEXUALLY_EXPLICIT", threshold=safety_threshold, method=safety_method),
-            types.SafetySetting(category="HARM_CATEGORY_JAILBREAK", threshold=safety_threshold, method=safety_method)
+        types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold=safety_threshold),
+        types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold=safety_threshold),
+        types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold=safety_threshold),
+        types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold=safety_threshold),
+        types.SafetySetting(category="HARM_CATEGORY_JAILBREAK", threshold=safety_threshold)
     ]
-
+    
     tools_list = []
     if request.tools:
         function_declarations = []
