@@ -136,10 +136,6 @@ DASHBOARD_HTML = """
     <main class="flex-1 flex flex-col relative z-10 overflow-hidden">
         <header class="h-14 md:h-16 glass-panel border-b border-slate-200 flex items-center justify-between px-4 md:px-8 shrink-0">
             <h1 id="page-title" class="text-base md:text-lg font-bold text-slate-800 tracking-tight">数据大盘</h1>
-            <button onclick="fetchStats()" class="bg-white hover:bg-slate-50 text-slate-600 px-3 py-1.5 md:px-4 md:py-2 rounded-lg text-xs md:text-sm transition-all border border-slate-200 shadow-sm flex items-center gap-2 font-medium">
-                <svg class="w-3.5 h-3.5 md:w-4 md:h-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-                <span class="hidden sm:inline">手动刷新</span>
-            </button>
         </header>
 
         <div class="flex-1 overflow-y-auto p-4 md:p-8 relative">

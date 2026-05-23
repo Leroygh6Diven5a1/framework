@@ -25,6 +25,8 @@ from message_processing import extract_reasoning_by_tags
 from credentials_manager import _refresh_auth
 from project_id_discovery import discover_project_id
 
+# 引入重试指标器，使手动退避重试也能实时统计并推送到面板中
+from logger import stats
 
 class FakeChatCompletionChunk:
     def __init__(self, data: Dict[str, Any]):
@@ -76,7 +78,7 @@ class ExpressClientWrapper:
                     continue
         
         if final_p_tk > 0 or final_c_tk > 0:
-            print(f"💰 [算力消耗] 提示词: {final_p_tk} | 模型思考与生成: {final_c_tk} | 总计: {final_t_tk} Tokens")
+            print(f"💰 [算力消耗统计] 提示词: {final_p_tk} | 思考与生成: {final_c_tk} | 总计: {final_t_tk} Tokens")
             
     async def _streaming_create(self, **kwargs) -> AsyncGenerator[FakeChatCompletionChunk, None]:
         endpoint = f"{self.base_url}/chat/completions"
@@ -110,7 +112,8 @@ class ExpressClientWrapper:
                         wave_index = attempt % 4
                         round_num = (attempt // 4) + 1
                         wait_time = 2 ** wave_index
-                        print(f"⚠️ [Express Stream] 遭遇 HTTP {e.response.status_code}. 第 {round_num} 轮/第 {wave_index + 1} 次护盾激活，等待 {wait_time}s 后重试...")
+                        stats.add_retry() # 核心：将 Express 手动重试也计入面板
+                        print(f"⚠️ [API 自动重试] 上游返回短暂异常 HTTP {e.response.status_code} (Express Stream)。正在激活第 {round_num} 轮/第 {wave_index + 1} 次护盾退避，等待 {wait_time}s 后重试...")
                         await asyncio.sleep(wait_time)
                         continue
                     raise e
@@ -129,7 +132,6 @@ class ExpressClientWrapper:
         if 'extra_body' in payload:
             payload.update(payload.pop('extra_body'))
 
-        # 完美自适应所有 httpx >= 0.25 的统一写法
         client_args = {'timeout': 300.0}
         if app_config.PROXY_URL:
             client_args['proxy'] = app_config.PROXY_URL
@@ -148,14 +150,15 @@ class ExpressClientWrapper:
                         p_tk = usage.get("prompt_tokens", 0)
                         c_tk = usage.get("completion_tokens", 0)
                         t_tk = usage.get("total_tokens", p_tk + c_tk)
-                        print(f"💰 [算力消耗] 提示词: {p_tk} | 模型思考与生成: {c_tk} | 总计: {t_tk} Tokens")
+                        print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens")
                     return FakeChatCompletion(resp_json)
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code in [429, 503, 502] and attempt < max_retries - 1:
                         wave_index = attempt % 4
                         round_num = (attempt // 4) + 1
                         wait_time = 2 ** wave_index
-                        print(f"⚠️ [Express Non-Stream] 遭遇 HTTP {e.response.status_code}. 第 {round_num} 轮/第 {wave_index + 1} 次护盾激活，等待 {wait_time}s 后重试...")
+                        stats.add_retry() # 核心：手动重试计入面板
+                        print(f"⚠️ [API 自动重试] 上游返回短暂异常 HTTP {e.response.status_code} (Express Non-Stream)。正在激活第 {round_num} 轮/第 {wave_index + 1} 次护盾退避，等待 {wait_time}s 后重试...")
                         await asyncio.sleep(wait_time)
                         continue
                     raise e
@@ -326,7 +329,7 @@ class OpenAIDirectHandler:
                         p_tk = usage.get("prompt_tokens", 0)
                         c_tk = usage.get("completion_tokens", 0)
                         t_tk = usage.get("total_tokens", p_tk + c_tk)
-                        print(f"💰 [算力消耗] 提示词: {p_tk} | 模型思考与生成: {c_tk} | 总计: {t_tk} Tokens")
+                        print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens")
 
                     choices = chunk_as_dict.get('choices')
                     if choices and isinstance(choices, list) and len(choices) > 0:
@@ -383,7 +386,7 @@ class OpenAIDirectHandler:
                     raise
                 except Exception as chunk_error:
                     error_msg = f"Error processing OpenAI chunk for {request.model}: {str(chunk_error)}"
-                    print(f"ERROR: {error_msg}")
+                    print(f"❌ [API 错误响应] 解析流分块错误 (Model: {request.model})。错误详情: {error_msg}")
                     if len(error_msg) > 1024:
                         error_msg = error_msg[:1024] + "..."
                     error_response = create_openai_error_response(500, error_msg, "server_error")
@@ -432,7 +435,7 @@ class OpenAIDirectHandler:
             if len(error_msg) > 1024:
                 error_msg = error_msg[:1024] + "..."
             error_msg_full = f"Error during OpenAI streaming for {request.model}: {error_msg}"
-            print(f"ERROR: {error_msg_full}")
+            print(f"❌ [API 错误响应] 流处理失败 (Model: {request.model})。错误详情: {error_msg_full}")
             error_response = create_openai_error_response(500, error_msg_full, "server_error")
             yield f"data: {json.dumps(error_response)}\n\n"
             yield "data: [DONE]\n\n"             
@@ -460,7 +463,7 @@ class OpenAIDirectHandler:
                 p_tk = usage.get("prompt_tokens", 0)
                 c_tk = usage.get("completion_tokens", 0)
                 t_tk = usage.get("total_tokens", p_tk + c_tk)
-                print(f"💰 [算力消耗] 提示词: {p_tk} | 模型思考与生成: {c_tk} | 总计: {t_tk} Tokens")
+                print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens")
 
             try:
                 choices = response_dict.get('choices')
@@ -488,7 +491,7 @@ class OpenAIDirectHandler:
             
         except Exception as e:
             error_msg = f"Error calling OpenAI client for {request.model}: {str(e)}"
-            print(f"ERROR: {error_msg}")
+            print(f"❌ [API 错误响应] 直连上游响应失败 (Model: {request.model})。错误详情: {error_msg}")
             return JSONResponse(
                 status_code=500, 
                 content=create_openai_error_response(500, error_msg, "server_error")
@@ -547,5 +550,5 @@ class OpenAIDirectHandler:
                 )
         except Exception as e:
             error_msg = f"Error in process_request for {request.model}: {e}"
-            print(f"ERROR: {error_msg}")
+            print(f"❌ [API 错误响应] 请求分发遇到阻断异常 (Model: {request.model})。错误详情: {error_msg}")
             return JSONResponse(status_code=500, content=create_openai_error_response(500, error_msg, "server_error"))

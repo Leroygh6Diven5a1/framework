@@ -89,8 +89,10 @@ def custom_print(*args, **kwargs):
 
     if "💰" in raw_msg and "Tokens" in raw_msg:
         try:
-            m = re.search(r'提示词:\s*(\d+).*?思考与生成:\s*(\d+)', raw_msg)
-            if m: stats.add_tokens(int(m.group(1)), int(m.group(2)))
+            # 强化的非捕获正则，兼容“思考与生成”和“模型思考与生成”两种控制台输出
+            m = re.search(r'提示词:\s*(\d+).*?(?:模型)?思考与生成:\s*(\d+)', raw_msg)
+            if m: 
+                stats.add_tokens(int(m.group(1)), int(m.group(2)))
         except:
             pass
 

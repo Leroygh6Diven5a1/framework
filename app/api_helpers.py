@@ -23,7 +23,7 @@ from message_processing import (
 import config as app_config
 from config import VERTEX_REASONING_TAG
 
-# 引入报错统计器
+# 引入报错重试统计器
 from logger import stats
 
 class StreamingReasoningProcessor:
@@ -145,8 +145,8 @@ def is_retryable_exception(e):
 def log_retry_attempt(retry_state):
     attempt = retry_state.attempt_number
     e = retry_state.outcome.exception()
-    stats.add_retry()
-    print(f"⚠️ [API 自动重试] 遇到上游拥堵或短暂拒绝 ({e.__class__.__name__})。正在进行第 {attempt} 次护盾退避重试...")
+    stats.add_retry() # 核心：自动退避重试精准计入大盘
+    print(f"⚠️ [API 自动重试] 遇到上游短暂拥堵或频率超限 ({e.__class__.__name__})。正在进行第 {attempt} 次退避重试...")
 
 @retry(
     stop=stop_after_attempt(20),
@@ -540,7 +540,7 @@ async def gemini_fake_stream_generator(
             p_tk = getattr(um, "prompt_token_count", 0) or 0
             c_tk = getattr(um, "candidates_token_count", 0) or 0
             t_tk = getattr(um, "total_token_count", p_tk + c_tk) or (p_tk + c_tk)
-            print(f"💰 [算力消耗] 提示词: {p_tk} | 模型思考与生成: {c_tk} | 总计: {t_tk} Tokens")
+            print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens")
 
         openai_response_dict = convert_to_openai_format(raw_gemini_response, request_obj.model)
         
@@ -565,7 +565,7 @@ async def gemini_fake_stream_generator(
         raise
     except Exception as e_outer_gemini:
         err_msg_detail = f"Error in gemini_fake_stream_generator (model: '{request_obj.model}'): {type(e_outer_gemini).__name__} - {str(e_outer_gemini)}"
-        print(f"ERROR: {err_msg_detail}")
+        print(f"❌ [API 错误响应] 假流发生器运行崩溃 (Model: {request_obj.model})。错误详情: {err_msg_detail}")
         sse_err_msg_display = str(e_outer_gemini)
         if len(sse_err_msg_display) > 512: sse_err_msg_display = sse_err_msg_display[:512] + "..."
         err_resp_sse = create_openai_error_response(500, sse_err_msg_display, "server_error")
@@ -605,181 +605,4 @@ async def openai_fake_stream_generator(
         raw_response_obj = await api_call_task 
         openai_response_dict = raw_response_obj.model_dump(exclude_unset=True, exclude_none=True)
 
-        if app_config.SAFETY_SCORE and hasattr(raw_response_obj, "choices") and raw_response_obj.choices:
-            for i, choice_obj in enumerate(raw_response_obj.choices):
-                if hasattr(choice_obj, "safety_ratings") and choice_obj.safety_ratings:
-                    safety_html = _create_safety_ratings_html(choice_obj.safety_ratings)
-                    if i < len(openai_response_dict.get("choices", [])):
-                        choice_dict = openai_response_dict["choices"][i]
-                        message_dict = choice_dict.get("message")
-                        if message_dict:
-                            current_content = message_dict.get("content") or ""
-                            message_dict["content"] = current_content + safety_html
-
-        if openai_response_dict.get("choices") and \
-           isinstance(openai_response_dict["choices"], list) and \
-           len(openai_response_dict["choices"]) > 0:
-            
-            first_choice_dict_item = openai_response_dict["choices"][0]
-            if first_choice_dict_item and isinstance(first_choice_dict_item, dict) :
-                choice_message_ref = first_choice_dict_item.get("message", {})
-                original_content = choice_message_ref.get("content")
-                if isinstance(original_content, str):
-                    reasoning_text, actual_content = extract_reasoning_by_tags(original_content, VERTEX_REASONING_TAG)
-                    choice_message_ref["content"] = actual_content
-                    if reasoning_text:
-                        choice_message_ref["reasoning_content"] = reasoning_text
-        
-        async for chunk_sse in _chunk_openai_response_dict_for_sse(
-            openai_response_dict=openai_response_dict,
-            response_id_override=response_id, 
-            model_name_override=request_obj.model
-        ):
-            yield chunk_sse
-            
-    except asyncio.CancelledError:
-        print(f"INFO: Client disconnected during Fake Stream (OpenAI: {request_obj.model}). Cleaning up.")
-        if "api_call_task" in locals() and not api_call_task.done():
-            api_call_task.cancel()
-        raise
-    except Exception as e_outer: 
-        err_msg_detail = f"Error in openai_fake_stream_generator (model: '{request_obj.model}'): {type(e_outer).__name__} - {str(e_outer)}"
-        print(f"ERROR: {err_msg_detail}")
-        sse_err_msg_display = str(e_outer)
-        if len(sse_err_msg_display) > 512: sse_err_msg_display = sse_err_msg_display[:512] + "..."
-        err_resp_sse = create_openai_error_response(500, sse_err_msg_display, "server_error")
-        json_payload_error = json.dumps(err_resp_sse)
-        if not is_auto_attempt:
-            yield f"data: {json_payload_error}\n\n"
-            yield "data: [DONE]\n\n"
-        if is_auto_attempt: raise
-
-async def execute_gemini_call(
-    current_client: Any, 
-    model_to_call: str,  
-    prompt_func: Callable[[List[OpenAIMessage]], List[types.Content]], 
-    gen_config_dict: Dict[str, Any], 
-    request_obj: OpenAIRequest, 
-    is_auto_attempt: bool = False
-):
-    actual_prompt_for_call = prompt_func(request_obj.messages)
-    client_model_name_for_log = getattr(current_client, "model_name", "unknown_direct_client_object")
-    print(f"INFO: execute_gemini_call for requested API model '{model_to_call}', using client object with internal name '{client_model_name_for_log}'. Original request model: '{request_obj.model}'")
-    
-    if request_obj.stream:
-        is_image_request = "image" in request_obj.model.lower()
-        
-        if app_config.FAKE_STREAMING_ENABLED or is_image_request:
-            if is_image_request:
-                 print("INFO: 触发生图保护机制 —— 已强制切换为假流式输出以避开 Google 报错限制！")
-            return StreamingResponse(
-                gemini_fake_stream_generator(
-                    current_client, model_to_call, actual_prompt_for_call,
-                    gen_config_dict, request_obj, is_auto_attempt
-                ), media_type="text/event-stream"
-            )
-        else: # True Streaming
-            response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
-            async def _gemini_real_stream_generator_inner():
-                max_retries = 20
-                for attempt in range(max_retries):
-                    try:
-                        stream_gen_obj = await current_client.aio.models.generate_content_stream(
-                            model=model_to_call, 
-                            contents=actual_prompt_for_call,
-                            config=gen_config_dict
-                        )
-                        
-                        final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
-                        
-                        async for chunk_item_call in stream_gen_obj:
-                            if hasattr(chunk_item_call, "usage_metadata") and chunk_item_call.usage_metadata:
-                                um = chunk_item_call.usage_metadata
-                                final_p_tk = getattr(um, "prompt_token_count", 0) or 0
-                                final_c_tk = getattr(um, "candidates_token_count", 0) or 0
-                                final_t_tk = getattr(um, "total_token_count", final_p_tk + final_c_tk) or (final_p_tk + final_c_tk)
-                                    
-                            yield convert_chunk_to_openai(chunk_item_call, request_obj.model, response_id_for_stream, 0)
-                        
-                        if final_p_tk > 0 or final_c_tk > 0:
-                            print(f"💰 [算力消耗] 提示词: {final_p_tk} | 模型思考与生成: {final_c_tk} | 总计: {final_t_tk} Tokens")
-                            
-                        yield "data: [DONE]\n\n"
-                        break 
-                        
-                    except asyncio.CancelledError:
-                        print(f"INFO: Client disconnected during Real Stream ({model_to_call}). Clean abort.")
-                        raise
-                    except Exception as e_stream_call:
-                        error_str = str(e_stream_call).lower()
-                        is_retryable = False
-                        
-                        if "429" in error_str or "503" in error_str or "too many requests" in error_str or "quota" in error_str or "resource exhausted" in error_str:
-                            is_retryable = True
-                            
-                        if is_retryable and attempt < max_retries - 1:
-                            wave_index = attempt % 4
-                            round_num = (attempt // 4) + 1
-                            wait_time = 2 ** wave_index
-                            print(f"⚠️ [Gemini SDK Stream] 遭遇算力天花板/速率限制. 第 {round_num} 轮/第 {wave_index + 1} 次护盾激活，等待 {wait_time}s 后重试...")
-                            await asyncio.sleep(wait_time)
-                            continue 
-                            
-                        err_msg_detail_stream = f"Streaming Error (Gemini API, model string: '{model_to_call}'): {type(e_stream_call).__name__} - {str(e_stream_call)}"
-                        print(f"ERROR: {err_msg_detail_stream}")
-                        s_err = str(e_stream_call); s_err = s_err[:1024]+"..." if len(s_err)>1024 else s_err
-                        err_resp = create_openai_error_response(500,s_err,"server_error")
-                        j_err = json.dumps(err_resp)
-                        if not is_auto_attempt: 
-                            yield f"data: {j_err}\n\n"
-                            yield "data: [DONE]\n\n"
-                        else:
-                            raise e_stream_call
-            
-            return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream")
-    else: # Non-streaming
-        response_obj_call = await execute_with_retry(
-            current_client.aio.models.generate_content,
-            model=model_to_call, 
-            contents=actual_prompt_for_call,
-            config=gen_config_dict
-        )
-        if hasattr(response_obj_call, "prompt_feedback") and \
-           hasattr(response_obj_call.prompt_feedback, "block_reason") and \
-           response_obj_call.prompt_feedback.block_reason:
-            block_msg = f"Blocked (Gemini): {response_obj_call.prompt_feedback.block_reason}"
-            if hasattr(response_obj_call.prompt_feedback,"block_reason_message") and \
-               response_obj_call.prompt_feedback.block_reason_message: 
-                block_msg+=f" ({response_obj_call.prompt_feedback.block_reason_message})"
-            raise ValueError(block_msg)
-        
-        if not is_gemini_response_valid(response_obj_call):
-            error_details = f"Invalid non-streaming Gemini response for model string '{model_to_call}'. "
-            if hasattr(response_obj_call, "candidates"):
-                error_details += f"Candidates: {len(response_obj_call.candidates) if response_obj_call.candidates else 0}. "
-                if response_obj_call.candidates and len(response_obj_call.candidates) > 0:
-                    candidate = response_obj_call.candidates if isinstance(response_obj_call.candidates, list) else response_obj_call.candidates
-                    if hasattr(candidate, "content"):
-                        error_details += "Has content. "
-                        if hasattr(candidate.content, "parts"):
-                            error_details += f"Parts: {len(candidate.content.parts) if candidate.content.parts else 0}. "
-                            if candidate.content.parts and len(candidate.content.parts) > 0:
-                                part = candidate.content.parts if isinstance(candidate.content.parts, list) else candidate.content.parts
-                                if hasattr(part, "text"):
-                                    text_preview = str(getattr(part, "text", ""))[:100]
-                                    error_details += f"First part text: '{text_preview}'"
-                                elif hasattr(part, "function_call"):
-                                    error_details += f"First part is function_call: {part.function_call.name}"
-            else:
-                error_details += f"Response type: {type(response_obj_call).__name__}"
-            raise ValueError(error_details)
-        
-        if hasattr(response_obj_call, "usage_metadata") and response_obj_call.usage_metadata:
-            um = response_obj_call.usage_metadata
-            p_tk = getattr(um, "prompt_token_count", 0) or 0
-            c_tk = getattr(um, "candidates_token_count", 0) or 0
-            t_tk = getattr(um, "total_token_count", p_tk + c_tk) or (p_tk + c_tk)
-            print(f"💰 [算力消耗] 提示词: {p_tk} | 模型思考与生成: {c_tk} | 总计: {t_tk} Tokens")
-
-        openai_response_content = convert_to_openai_format(response_obj_call, request_obj.model)
-        return JSONResponse(content=openai_response_content)
+        if app_config.SAFETY_SCORE and hasattr(raw_response_obj, "choices") and raw_response_obj.
