@@ -45,7 +45,7 @@ def optimize_image_bytes(image_data: bytes, original_mime: str, max_size_bytes: 
                 img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
             
             output = io.BytesIO()
-            # 默认使用高保真 JPEG
+            # 首选 Q=85 极致画质
             img.save(output, format='JPEG', quality=85, optimize=True)
             opt_data = output.getvalue()
             
@@ -199,7 +199,6 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                 if isinstance(message.content, str):
                     image_parts, clean_text = _extract_markdown_images_to_parts(message.content)
                     if clean_text: parts.append(types.Part.from_text(text=clean_text))
-                    # 此处取消了对 model 的屏蔽，直接允许历史图片作为上下文传回
                     parts.extend(image_parts)
         else: 
             if message.content is None: continue
@@ -212,8 +211,6 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
             if isinstance(message.content, str):
                 image_parts, clean_text = _extract_markdown_images_to_parts(message.content)
                 if clean_text: parts.append(types.Part.from_text(text=clean_text))
-                
-                # 无条件传回历史生成图（哪怕是 model 角色），并经过最上方 optimize_image_bytes 强效过滤
                 parts.extend(image_parts)
 
             elif isinstance(message.content, list):
@@ -246,16 +243,14 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                                             resp = client.get(image_url)
                                             resp.raise_for_status()
                                             return resp.content, resp.headers.get("content-type", "image/jpeg")
-                                        with concurrent.futures.ThreadPoolExecutor() as pool:
-                                            future = pool.submit(fetch_img)
-                                            img_bytes, mime_type = future.result(timeout=12) 
-                                            opt_bytes, opt_mime = optimize_image_bytes(img_bytes, mime_type)
-                                            parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
-                                    except Exception as e:
-                                        print(f"Warning: Failed to fetch remote image {image_url}: {e}")
-                    elif hasattr(part_item, "text"):
-                        parts.append(types.Part.from_text(text=part_item.text))
-                    
+                                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                                        future = pool.submit(fetch_img)
+                                        img_bytes, mime_type = future.result(timeout=12) 
+                                        opt_bytes, opt_mime = optimize_image_bytes(img_bytes, mime_type)
+                                        parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
+                                except Exception as e:
+                                    print(f"Warning: Failed to fetch remote image {image_url}: {e}")
+
                     elif hasattr(part_item, "type") and getattr(part_item, "type") == "image_url":
                         img_url_data = part_item.image_url
                         url_str = getattr(img_url_data, "url", "") if hasattr(img_url_data, "url") else (img_url_data.get("url", "") if isinstance(img_url_data, dict) else "")
@@ -286,6 +281,9 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                                     parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
                             except Exception as e:
                                 print(f"Warning: Failed to fetch remote image {url_str}: {e}")
+                                
+                    elif hasattr(part_item, "text"):
+                        parts.append(types.Part.from_text(text=part_item.text))
 
         if not parts: continue
         raw_gemini_messages.append(types.Content(role=current_gemini_role, parts=parts))
