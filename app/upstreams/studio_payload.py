@@ -55,7 +55,7 @@ def build_studio_graphql_payload(model_name: str, request: OpenAIRequest, gen_co
     动态结合浏览器抓取的 requestContext 和 querySignature，
     组装出与谷歌前端最新构建完全吻合的 GraphQL 私有网关请求载荷
     """
-    # 动态捕获上下文（拒绝任何形式的硬编码）
+    # 动态捕获上下文
     harvested_body = auth_bundle.get("body", {})
     request_context = harvested_body.get("requestContext")
     query_signature = harvested_body.get("querySignature")
@@ -64,11 +64,16 @@ def build_studio_graphql_payload(model_name: str, request: OpenAIRequest, gen_co
     if not request_context or not query_signature:
         print("⚠️ [Web Proxy] 警告：当前 Auth Bundle 数据不完整，可能面临请求拒绝！")
 
+    # 4. 动态构建符合当前 GCP Project 环境的模型全路径
+    project_id = request_context.get("projectId") if request_context else None
+    if project_id and not model_name.startswith("projects/"):
+        model_name = f"projects/{project_id}/locations/global/publishers/google/models/{model_name}"
+
     # 1. 编译 OpenAI 消息历史，并一键完成 Pydantic 剥离和驼峰转换
     raw_contents = create_gemini_prompt(request.messages)
     camel_contents = convert_keys_to_camel(serialize_pydantic(raw_contents))
     
-    # 2. 转换参数生成配置
+    # 2. 转换参数配置
     camel_config = convert_keys_to_camel(serialize_pydantic(gen_config_dict))
     
     # 从配置中摘出系统指令与安全配置
