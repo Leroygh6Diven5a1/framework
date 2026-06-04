@@ -14,7 +14,7 @@ class ProxyStats:
         self.total_requests = 0
         self.success_requests = 0
         self.error_requests = 0
-        self.retry_counts = 0  # 拥堵重试次数
+        self.retry_counts = 0  
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self.lock = threading.Lock()
@@ -28,7 +28,6 @@ class ProxyStats:
             self.error_requests += 1
 
     def add_request(self, success=True, is_error=False):
-        # 保持旧接口向下兼容，防止其他文件关联报错
         with self.lock:
             if is_error:
                 self.error_requests += 1
@@ -41,11 +40,9 @@ class ProxyStats:
         with self.lock:
             self.prompt_tokens += p_tokens
             self.completion_tokens += c_tokens
-            # 只有当实际成功返回并捕获到 Token 时，才将该请求计入“成功响应”
             self.success_requests += 1
 
     def get_json_stats(self):
-        """向前端面板提供实时数据"""
         return {
             "uptime": round(time.time() - self.start_time, 2),
             "total": self.total_requests,
@@ -79,25 +76,47 @@ class SSELogger:
 rt_logger = SSELogger()
 
 def custom_print(*args, **kwargs):
+    """
+    精修后的多线程安全打印代理
+    防御式编程：杜绝双重 file 参数导致的冲突，捕获所有运行时异常
+    """
     import io
     buf = io.StringIO()
-    original_print(*args, file=buf, **kwargs)
-    raw_msg = buf.getvalue().strip()
     
+    # 1. 深度隔离 kwargs，重定向输出到缓冲区
+    kwargs_for_buffer = kwargs.copy()
+    kwargs_for_buffer["file"] = buf
+    
+    raw_msg = ""
+    try:
+        original_print(*args, **kwargs_for_buffer)
+        raw_msg = buf.getvalue().strip()
+    except Exception:
+        pass  # 缓冲写入异常时安全退出，不阻断主输出
+        
+    # 2. 调用原始打印，保持原有的控制台输出目标不变
+    try:
+        original_print(*args, **kwargs)
+    except Exception:
+        pass
+
     if not raw_msg:
         return
 
+    # Token 统计解析
     if "💰" in raw_msg and "Tokens" in raw_msg:
         try:
-            # 强化的非捕获正则，兼容“思考与生成”和“模型思考与生成”两种控制台输出
             m = re.search(r'提示词:\s*(\d+).*?(?:模型)?思考与生成:\s*(\d+)', raw_msg)
             if m: 
                 stats.add_tokens(int(m.group(1)), int(m.group(2)))
-        except:
+        except Exception:
             pass
 
-    original_print(raw_msg)
-    plain_msg = ANSI_ESCAPE.sub('', raw_msg)
-    rt_logger.push(plain_msg)
+    # 推送至前端大盘日志
+    try:
+        plain_msg = ANSI_ESCAPE.sub('', raw_msg)
+        rt_logger.push(plain_msg)
+    except Exception:
+        pass
 
 builtins.print = custom_print
