@@ -10,19 +10,19 @@ from upstreams.studio_payload import build_studio_graphql_payload
 from runtime_state import app_state
 import config as app_config
 
-# 引入完美的流式追踪与消抖处理器（解决老版本乱码问题的关键）
 from stream_engine.processor import StreamProcessor
 
 class WebProxyUpstream(BaseUpstream):
     """
     谷歌 Agent Platform Studio 网页反代渠道处理器
+    加入底层 HTTP/1.1 降维打击与全套浏览器人皮伪装机制
     """
     async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request):
         auth_bundle = app_state.get_auth_bundle()
         if not auth_bundle or "headers" not in auth_bundle:
             return JSONResponse(
                 status_code=401,
-                content={"error": {"message": "Web Proxy 凭证尚未配置，请在控制台填入最新 Auth Bundle", "type": "auth_error"}}
+                content={"error": {"message": "Web Proxy 凭证尚未配置，请检查浏览器自愈脚本", "type": "auth_error"}}
             )
 
         base_model_name = request_obj.model
@@ -38,27 +38,31 @@ class WebProxyUpstream(BaseUpstream):
         
         if is_search:
             payload["variables"].setdefault("tools", []).append({"googleSearch": {}})
-            print(f"🔎 [搜索增强] 已为 Web 模式下的模型 {base_model_name} 挂载 googleSearch 插件。")
+            print(f"🔎 [搜索增强] 已为 Web 模式模型挂载 googleSearch 插件。")
 
         url = auth_bundle.get("url")
         raw_headers = auth_bundle.get("headers", {}).copy()
         
-        # 强制将所有 Header 键名转换为小写，适配 HTTP/2 严格规范
-        headers = {k.lower(): v for k, v in raw_headers.items()}
+        # 1. 全部键名转换为小写
+        headers = {k.lower(): str(v) for k, v in raw_headers.items()}
         
-        # 补全被浏览器屏蔽的安全防护头
+        # 2. 补全防跨站安全头
         headers["referer"] = "https://console.cloud.google.com/"
         headers["origin"] = "https://console.cloud.google.com"
         
+        # 3. 剥离可能导致解压乱码或重算冲突的头
         headers.pop("accept-encoding", None)
         headers.pop("content-length", None)
-        headers["content-type"] = "application/json"
+        # 不要手动设置 content-type，交由 httpx.post(json=payload) 自动推导并设置长度
 
-        # 配置支持双协议的高性能客户端
+        # ==========================================
+        # 核心修复：关闭 HTTP/2 严格指纹校验，降级为 HTTP/1.1
+        # 极大提升绕过谷歌 GFE 网关 IP+TLS 复合校验的成功率
+        # ==========================================
         client_kwargs = {
             "timeout": 120.0,
             "follow_redirects": True,
-            "http2": True  # 明确启用 HTTP/2 以适配谷歌网关
+            "http2": False  
         }
         if app_config.PROXY_URL:
             client_kwargs["proxy"] = app_config.PROXY_URL
@@ -115,24 +119,6 @@ class WebProxyUpstream(BaseUpstream):
                                             full_text += delta["content"]
                                         if "reasoning_content" in delta and delta["reasoning_content"] is not None:
                                             reasoning_text += delta["reasoning_content"]
-                                        if "tool_calls" in delta and delta["tool_calls"] is not None:
-                                            for tc_delta in delta["tool_calls"]:
-                                                idx = tc_delta.get("index", 0)
-                                                if len(tool_calls) <= idx:
-                                                    tool_calls.append({
-                                                        "id": tc_delta.get("id", ""),
-                                                        "type": "function",
-                                                        "function": {"name": "", "arguments": ""}
-                                                    })
-                                                tc = tool_calls[idx]
-                                                if tc_delta.get("id"):
-                                                    tc["id"] = tc_delta["id"]
-                                                if "function" in tc_delta:
-                                                    fn_delta = tc_delta["function"]
-                                                    if "name" in fn_delta:
-                                                        tc["function"]["name"] = fn_delta["name"]
-                                                    if "arguments" in fn_delta:
-                                                        tc["function"]["arguments"] += fn_delta["arguments"]
                                         if choices[0].get("finish_reason"):
                                             final_finish_reason = choices[0]["finish_reason"]
                                 except Exception:
@@ -161,9 +147,5 @@ class WebProxyUpstream(BaseUpstream):
                     "message": message_payload,
                     "finish_reason": final_finish_reason
                 }],
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0
-                }
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
             })
