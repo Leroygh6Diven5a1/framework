@@ -49,16 +49,19 @@ class WebProxyUpstream(BaseUpstream):
         url = auth_bundle.get("url")
         headers = auth_bundle.get("headers", {}).copy()
         
-        # 核心修复：补全安全保护头
+        # ==========================================
+        # 核心修复：强制补全安全保护头，防止 WAF 拦截
+        # ==========================================
         headers["referer"] = "https://console.cloud.google.com/"
         headers["origin"] = "https://console.cloud.google.com"
+        headers["user-agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         
         # 清除会导致 httpx 双流异步解析异常的 Header
         headers.pop("accept-encoding", None)
         headers.pop("content-length", None)
         headers["content-type"] = "application/json"
 
-        # 3. 构造 httpx 客户端参数，继承你的 .env 代理配置，并转为兼容性极佳的 HTTP/1.1 握手
+        # 3. 构造 httpx 客户端参数，继承你的 .env 代理配置
         client_kwargs = {
             "timeout": 120.0,
             "follow_redirects": True
@@ -71,9 +74,10 @@ class WebProxyUpstream(BaseUpstream):
         # 4. 流式处理通道 (stream = True)
         if request_obj.stream:
             async def stream_generator():
-                # 防御式全局异常保护：确保连接报错时立刻通知客户端并输出详细日志，绝不悬挂
+                # 防御式全局异常保护：确保连接报错时立刻通知客户端并输出详细日志
                 try:
                     processor = StreamProcessor()
+                    processor.enable_debug(True) # 开启调试日志输出，揭示每一个隐藏细节
                     async with httpx.AsyncClient(**client_kwargs) as client:
                         async with client.stream("POST", url, headers=headers, json=payload) as response:
                             if response.status_code != 200:
@@ -98,6 +102,7 @@ class WebProxyUpstream(BaseUpstream):
             tool_calls = []
             
             processor = StreamProcessor()
+            processor.enable_debug(True)
             async with httpx.AsyncClient(**client_kwargs) as client:
                 try:
                     async with client.stream("POST", url, headers=headers, json=payload) as response:
