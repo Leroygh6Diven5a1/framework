@@ -2,7 +2,7 @@ import time
 import httpx
 import asyncio
 import secrets
-from fastapi import FastAPI, Depends, Request, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, Request, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,7 +17,37 @@ from logger import rt_logger, stats
 import config
 from runtime_state import app_state
 
+from headless.browser import HeadlessBrowser
+from headless.harvester import CredentialHarvester
+from upstreams.headless_proxy import set_headless_browser
+
 express_key_manager = ExpressKeyManager()
+_global_browser = None
+
+async def run_headless_browser():
+    """后台运行无头浏览器"""
+    global _global_browser
+    browser = HeadlessBrowser()
+    _global_browser = browser
+    set_headless_browser(browser)
+    
+    harvester = CredentialHarvester(on_credentials=lambda creds: app_state.update_auth_bundle(creds))
+    
+    if not await browser.start(headless=config.HEADLESS_MODE):
+        print("❌ 无头浏览器启动失败，请检查 Playwright 安装和配置")
+        return
+        
+    await browser.setup_request_interception(harvester.handle_request)
+    
+    if await browser.navigate_to_vertex():
+        # 获取初始凭证
+        await browser.send_test_message()
+        
+        # 开启定时刷新循环
+        while browser.is_running:
+            await asyncio.sleep(config.CREDENTIAL_REFRESH_INTERVAL)
+            if browser.is_running:
+                await browser.send_test_message()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -28,7 +58,14 @@ async def lifespan(app: FastAPI):
     else:
         print("⚠️ [密钥配置] 未检测到 VERTEX_EXPRESS_API_KEY。若不启用网页反代，聊天请求将会报错。")
     await refresh_models_config_cache()
+    
+    # 根据大盘配置启动无头浏览器
+    if app_state.is_web_proxy_enabled():
+        asyncio.create_task(run_headless_browser())
+        
     yield
+    if _global_browser and _global_browser.is_running:
+        await _global_browser.close()
 
 app = FastAPI(title="OpenAI to Gemini Adapter", lifespan=lifespan)
 
@@ -169,19 +206,37 @@ DASHBOARD_HTML = """
                             </label>
                             <label class="flex items-center gap-2 cursor-pointer font-medium text-sm text-slate-700">
                                 <input type="radio" name="api_mode" value="web_proxy" onchange="updateMode('web_proxy')" class="w-4 h-4 text-blue-600 border-slate-300">
-                                <span>Agent Platform Studio (网页免额度)</span>
+                                <span>Agent Platform Studio (无头浏览器反代)</span>
                             </label>
                         </div>
                     </div>
                     
                     <div id="web-proxy-config" class="hidden mt-5 pt-5 border-t border-slate-100 space-y-4">
-                        <div>
-                            <label class="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">手动导入凭证 (Auth Bundle JSON)</label>
-                            <textarea id="auth-bundle-input" class="w-full text-xs font-mono p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none" rows="4" placeholder="在此粘贴书签脚本或日志中生成的最新 JSON 格式凭证..."></textarea>
+                        <div class="flex flex-col gap-3">
+                            <div class="flex items-center justify-between p-3 bg-slate-50 rounded-xl border border-slate-200">
+                                <div class="flex items-center gap-3">
+                                    <div id="headless-status-indicator" class="w-3 h-3 rounded-full bg-slate-300"></div>
+                                    <div class="flex flex-col">
+                                        <span class="text-xs font-bold text-slate-700">无头浏览器状态</span>
+                                        <span id="headless-status-text" class="text-xs text-slate-500">检测中...</span>
+                                    </div>
+                                </div>
+                                <button onclick="refreshCredentials()" class="bg-indigo-50 hover:bg-indigo-100 text-indigo-600 border border-indigo-200 font-semibold text-xs px-4 py-1.5 rounded-lg transition-all shadow-sm">立即触发刷新</button>
+                            </div>
+                            
+                            <div class="flex items-center justify-between p-3 bg-slate-50 rounded-xl border border-slate-200">
+                                <div class="flex flex-col">
+                                    <span class="text-xs font-bold text-slate-700">当前会话凭证</span>
+                                    <span id="credential-age-text" class="text-xs text-slate-500">获取中...</span>
+                                </div>
+                                <span class="text-xs text-slate-400 font-medium">系统自动维护会话活性</span>
+                            </div>
                         </div>
-                        <div class="flex items-center justify-between">
-                            <span class="text-xs text-slate-400">💡 提示：更推荐通过自愈脚本实现保活。若已部署脚本，WebSocket 会全自动热更新该配置，无需手动粘贴。</span>
-                            <button onclick="saveAuthBundle()" class="bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs px-5 py-2 rounded-xl shadow-sm transition-all shrink-0">应用手动凭证</button>
+                        <div class="text-[11px] text-slate-600 mt-3 p-3 bg-blue-50/70 rounded-xl border border-blue-100/70 leading-relaxed shadow-sm">
+                            💡 <span class="font-bold text-blue-700">首次使用指南：</span><br>
+                            1. 停止当前服务，在 <code>.env</code> 中设置 <code>HEADLESS_MODE=False</code> 并启动。<br>
+                            2. 系统将弹出浏览器窗口，请在此窗口内手动登录您的 Google 账号（由于是持久化会话，只需登录一次）。<br>
+                            3. 登录完成并跳转到 Vertex AI 界面后，关闭服务。将 <code>HEADLESS_MODE=True</code> 改回，重启即可全自动静默反代。
                         </div>
                     </div>
                 </div>
@@ -294,6 +349,43 @@ DASHBOARD_HTML = """
                 document.getElementById('stat-total-tokens').innerText = formatNumber(data.prompt_tokens + data.completion_tokens);
                 
                 renderChart(data.success, data.error, data.retries);
+                
+                if (document.querySelector('input[name="api_mode"][value="web_proxy"]').checked) {
+                    try {
+                        const statusRes = await fetch('/api/headless/status');
+                        const statusData = await statusRes.json();
+                        
+                        const indicator = document.getElementById('headless-status-indicator');
+                        const statusText = document.getElementById('headless-status-text');
+                        const ageText = document.getElementById('credential-age-text');
+                        
+                        if (statusData.is_running) {
+                            indicator.className = 'w-3 h-3 rounded-full bg-emerald-500';
+                            statusText.innerText = '🟢 运行中';
+                        } else {
+                            indicator.className = 'w-3 h-3 rounded-full bg-rose-500';
+                            statusText.innerText = '🔴 已停止';
+                        }
+                        
+                        if (statusData.credential_age !== null && statusData.credential_age < 999999) {
+                            const ageSecs = Math.floor(statusData.credential_age);
+                            if (ageSecs < 60) {
+                                ageText.innerText = `最近更新: ${ageSecs} 秒前`;
+                                ageText.className = 'text-xs text-emerald-600 font-bold';
+                            } else {
+                                ageText.innerText = `最近更新: ${Math.floor(ageSecs / 60)} 分钟前`;
+                                if (ageSecs > 180) {
+                                    ageText.className = 'text-xs text-amber-500 font-bold';
+                                } else {
+                                    ageText.className = 'text-xs text-emerald-600 font-bold';
+                                }
+                            }
+                        } else {
+                            ageText.innerText = '等待获取凭证...';
+                            ageText.className = 'text-xs text-slate-500';
+                        }
+                    } catch (ignore) {}
+                }
             } catch (e) {
                 console.error("Fetch stats failed", e);
             }
@@ -308,22 +400,17 @@ DASHBOARD_HTML = """
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ mode: mode })
             });
+            if(mode === 'web_proxy') fetchStats(); // Refresh immediately
         }
 
-        async function saveAuthBundle() {
-            const rawText = document.getElementById('auth-bundle-input').value.trim();
-            if(!rawText) return;
+        async function refreshCredentials() {
             try {
-                const bundle = JSON.parse(rawText);
-                const res = await fetch('/api/settings/auth', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(bundle)
-                });
-                if(res.ok) alert("🎉 凭证加载成功！");
-                else alert("❌ 凭证格式或内容有误。");
+                const res = await fetch('/api/headless/refresh', { method: 'POST' });
+                if(res.ok) alert("🔄 已向无头浏览器发送刷新指令，可能需要数秒完成。");
+                else alert("❌ 刷新失败，请检查无头浏览器是否运行正常。");
+                setTimeout(fetchStats, 2000);
             } catch(e) {
-                alert("❌ JSON 格式解析失败，请检查粘贴的内容。");
+                alert("❌ 网络请求失败");
             }
         }
 
@@ -336,9 +423,6 @@ DASHBOARD_HTML = """
                     document.getElementById('web-proxy-config').classList.remove('hidden');
                 } else {
                     document.querySelector('input[name="api_mode"][value="api_key"]').checked = true;
-                }
-                if (state.auth_bundle && Object.keys(state.auth_bundle).length > 0) {
-                    document.getElementById('auth-bundle-input').value = JSON.stringify(state.auth_bundle, null, 2);
                 }
             } catch (e) {
                 console.error("获取运行状态失败", e);
@@ -407,7 +491,7 @@ async def get_stats_api(username: str = Depends(verify_auth)):
     return JSONResponse(content=stats.get_json_stats())
 
 # ==========================================
-# 💎 新增：大盘设置接口（动态切换与导入）
+# 💎 API：设置与无头浏览器控制
 # ==========================================
 class ModeSetting(BaseModel):
     mode: str
@@ -415,46 +499,36 @@ class ModeSetting(BaseModel):
 @app.get("/api/settings/runtime")
 async def get_runtime_settings(username: str = Depends(verify_auth)):
     return JSONResponse(content={
-        "use_web_proxy": app_state.is_web_proxy_enabled(),
-        "auth_bundle": app_state.get_auth_bundle()
+        "use_web_proxy": app_state.is_web_proxy_enabled()
     })
 
 @app.post("/api/settings/mode")
 async def set_settings_mode(setting: ModeSetting, username: str = Depends(verify_auth)):
     app_state.enable_web_proxy(setting.mode == "web_proxy")
-    return JSONResponse(content={"status": "success"})
-
-@app.post("/api/settings/auth")
-async def set_settings_auth(auth_data: dict, username: str = Depends(verify_auth)):
-    app_state.update_auth_bundle(auth_data)
-    print("✅ [手工导入] 成功通过大盘 UI 导入并写入最新 Web 凭证！")
-    return JSONResponse(content={"status": "success"})
-
-# ==========================================
-# 🔌 新增：WebSocket 双向自愈保活端点
-# ==========================================
-@app.websocket("/ws/harvester")
-async def websocket_harvester(websocket: WebSocket, key: str = None):
-    # 安全屏障：必须传入与后端完全匹配的 API_KEY 才能握手
-    if not key or key != config.API_KEY:
-        print("❌ [WebSocket] 鉴权拒绝：浏览器自愈脚本传入的 API_KEY 不正确。")
-        await websocket.close(code=1008)
-        return
+    
+    # 如果切换到 web_proxy 且浏览器未运行，尝试启动它
+    global _global_browser
+    if setting.mode == "web_proxy" and (not _global_browser or not _global_browser.is_running):
+        asyncio.create_task(run_headless_browser())
         
-    await websocket.accept()
-    print("🔌 [WebSocket] 浏览器自愈插件连接成功，正在监听会话心跳...")
-    try:
-        while True:
-            data = await websocket.receive_json()
-            if data.get("type") == "credentials_harvested":
-                harvest_payload = data.get("data")
-                if harvest_payload:
-                    app_state.update_auth_bundle(harvest_payload)
-                    print("🔄 [WebSocket] 自愈心跳：已接收浏览器推送的最新 Web 凭证并完成热更新！")
-    except WebSocketDisconnect:
-        print("🔌 [WebSocket] 浏览器自愈插件连接安全断开。")
-    except Exception as e:
-        print(f"⚠️ [WebSocket] 通信发生异常: {e}")
+    return JSONResponse(content={"status": "success"})
+
+@app.get("/api/headless/status")
+async def get_headless_status(username: str = Depends(verify_auth)):
+    global _global_browser
+    is_running = _global_browser is not None and _global_browser.is_running
+    return JSONResponse(content={
+        "is_running": is_running,
+        "credential_age": app_state.get_credential_age() if app_state.get_credential_timestamp() > 0 else None
+    })
+
+@app.post("/api/headless/refresh")
+async def trigger_headless_refresh(username: str = Depends(verify_auth)):
+    global _global_browser
+    if _global_browser and _global_browser.is_running:
+        asyncio.create_task(_global_browser.send_test_message())
+        return JSONResponse(content={"status": "success"})
+    return JSONResponse(status_code=503, content={"error": "无头浏览器未运行"})
 
 @app.get("/stream-logs")
 async def stream_logs_endpoint(request: Request, username: str = Depends(verify_auth)):
