@@ -77,6 +77,18 @@ class AppState:
             state = self._load_state()
             return state.get("google_cookie", "")
 
+    def set_project_id(self, project_id: str):
+        with self._lock:
+            state = self._load_state()
+            state["google_project_id"] = project_id
+            self._save_state(state)
+            print(f"🔄 [状态管理器] 项目 ID 已保存: {project_id}")
+
+    def get_project_id(self) -> str:
+        with self._lock:
+            state = self._load_state()
+            return state.get("google_project_id", "")
+
     # ========== 凭证生命周期管理（新增） ==========
 
     def get_credential_age(self) -> float:
