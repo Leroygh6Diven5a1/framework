@@ -212,7 +212,7 @@ DASHBOARD_HTML = """
                             </label>
                             <label class="flex items-center gap-2 cursor-pointer font-medium text-sm text-slate-700">
                                 <input type="radio" name="api_mode" value="web_proxy" onchange="updateMode('web_proxy')" class="w-4 h-4 text-blue-600 border-slate-300">
-                                <span>Agent Platform Studio (无头浏览器反代)</span>
+                                <span>Agent Platform Studio (Cookie直连)</span>
                             </label>
                         </div>
                     </div>
