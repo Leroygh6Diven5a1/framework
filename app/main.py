@@ -261,7 +261,7 @@ DASHBOARD_HTML = """
                             💡 <span class="font-bold text-blue-700">Cookie 直连模式（免浏览器/免重启）：</span><br>
                             <b>获取方法：</b>在电脑浏览器打开 <code>console.cloud.google.com</code> 并登录，<br>
                             按 <b>F12</b> → 切换到 <b>Console</b> 面板 → 输入 <code class="bg-blue-100 px-1 py-0.5 rounded select-all">copy(document.cookie)</code> 回车 → Cookie 已复制到剪贴板！<br>
-                            <b>Project ID：</b>从 Studio URL 的 <code>?project=xxx</code> 参数中获取。<br>
+                            <b>手机获取（支持 HttpOnly）：</b>iOS 安装 Safari 插件 <code>Cookie-Editor</code> / 安卓使用 Kiwi 浏览器安装 <code>Cookie-Editor</code> 插件，登录后点击插件选择 Export 导出为 Header String 或 JSON 直接粘贴到此处。<br>
                             ⚠️ <span class="text-amber-600 font-semibold">Cookie 有效期约 1~2 小时</span>（PSIDTS 会过期），过期后重新获取粘贴即可。
                         </div>
                         
@@ -449,8 +449,25 @@ DASHBOARD_HTML = """
             if(mode === 'web_proxy') fetchStats(); // Refresh immediately
         }
 
+        function tryParseCookies(str) {
+            str = str.trim();
+            if (str.startsWith('[') && str.endsWith(']')) {
+                try {
+                    const arr = JSON.parse(str);
+                    if (Array.isArray(arr)) {
+                        return arr.map(c => {
+                            const name = c.name || c.key;
+                            const value = c.value;
+                            return (name && value) ? `${name}=${value}` : '';
+                        }).filter(Boolean).join('; ');
+                    }
+                } catch (e) {}
+            }
+            return str;
+        }
+
         function handleCookieInput(e) {
-            const val = e.target.value.trim();
+            let val = e.target.value.trim();
             if (val.includes('===VERTEX_SYNC===')) {
                 const lines = val.split('\\n');
                 let parsedProject = '';
@@ -464,9 +481,15 @@ DASHBOARD_HTML = """
                     }
                 }
                 if (parsedProject && parsedCookie) {
+                    parsedCookie = tryParseCookies(parsedCookie);
                     document.getElementById('google-cookie-input').value = parsedCookie;
                     document.getElementById('google-project-id-input').value = parsedProject;
                     alert('🎉 成功识别并解析一键同步凭证！\\nProject ID: ' + parsedProject);
+                }
+            } else {
+                const parsed = tryParseCookies(val);
+                if (parsed !== val) {
+                    document.getElementById('google-cookie-input').value = parsed;
                 }
             }
         }
@@ -490,10 +513,12 @@ DASHBOARD_HTML = """
                 if (parsedProject && parsedCookie) {
                     cookieStr = parsedCookie;
                     projectId = parsedProject;
-                    document.getElementById('google-cookie-input').value = cookieStr;
-                    document.getElementById('google-project-id-input').value = projectId;
                 }
             }
+
+            cookieStr = tryParseCookies(cookieStr);
+            document.getElementById('google-cookie-input').value = cookieStr;
+            document.getElementById('google-project-id-input').value = projectId;
 
             if(!cookieStr || !projectId) {
                 alert("请输入完整的 Cookie 字符串和 Project ID");
