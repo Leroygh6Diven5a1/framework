@@ -84,6 +84,21 @@ def _is_cookie_expired_error(error_msg: str) -> bool:
 
 # ========== requestContext 模板 ==========
 
+def _get_experiment_flags() -> str:
+    """获取 experimentFlagsBinary，优先使用配置，其次从无头浏览器捕获的凭证包中提取"""
+    if app_config.EXPERIMENT_FLAGS:
+        return app_config.EXPERIMENT_FLAGS
+    
+    bundle = app_state.get_auth_bundle()
+    if bundle and "body" in bundle and isinstance(bundle["body"], dict):
+        req_ctx = bundle["body"].get("requestContext")
+        if req_ctx and isinstance(req_ctx, dict):
+            flags = req_ctx.get("experimentFlagsBinary")
+            if flags:
+                return flags
+    return ""
+
+
 def _build_request_context(project_id: str) -> dict:
     """
     构建 batchGraphql 的 requestContext
@@ -100,7 +115,7 @@ def _build_request_context(project_id: str) -> dict:
         "projectId": project_id,
         "selectedPurview": {"projectId": project_id},
         "jurisdiction": "global",
-        "experimentFlagsBinary": app_config.EXPERIMENT_FLAGS or "",
+        "experimentFlagsBinary": _get_experiment_flags(),
         "localizationData": {"locale": "zh_CN", "timezone": "Asia/Hong_Kong"}
     }
 
