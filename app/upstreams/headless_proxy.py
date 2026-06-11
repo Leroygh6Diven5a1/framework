@@ -385,8 +385,6 @@ class HeadlessProxyUpstream(BaseUpstream):
         client_kwargs = {
             "timeout": httpx.Timeout(connect=30.0, read=180.0, write=30.0, pool=10.0),
             "follow_redirects": True,
-            "http1": True,
-            "http2": True,
         }
         if app_config.PROXY_URL:
             client_kwargs["proxy"] = app_config.PROXY_URL
