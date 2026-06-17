@@ -196,7 +196,7 @@ def _build_batch_graphql_body(
     
     if any(kw in model_name for kw in ("gemini-3", "gemini-2.5")):
         gen_config["thinkingConfig"] = {
-            "thinkingLevel": "MEDIUM",
+            "thinkingLevel": "HIGH",
             "includeThoughts": True
         }
     
