@@ -3,7 +3,7 @@ batchGraphql 直连代理上游通道
 
 基于 Agent Platform Studio Express Mode 的 batchGraphql 协议实现。
 支持完整的 Function Calling (工具调用) 与 Google Search。
-内置终极防弹 Schema 清洗器、参数按需传递与纯净历史回放机制。
+内置终极防弹 Schema 清洗器，精准剔除空参数防幻觉。
 """
 
 import json
@@ -43,12 +43,6 @@ COOKIE_EXPIRED_KEYWORDS = [
     "session expired", "invalid credentials"
 ]
 
-COOKIE_REFRESH_HINT = (
-    "\n\n💡 Cookie 可能已过期（PSIDTS 约 1-2 小时有效）。"
-    "请重新获取：在电脑浏览器打开 console.cloud.google.com，"
-    "按 F12 打开控制台，复制 Request Headers 中的 Cookie，然后到大盘粘贴新 Cookie。"
-)
-
 def _is_retryable_error(error_msg: str) -> bool:
     lower = error_msg.lower()
     return any(kw in lower for kw in RETRYABLE_KEYWORDS)
@@ -62,6 +56,7 @@ def _is_cookie_expired_error(error_msg: str) -> bool:
 ALLOWED_SCHEMA_FIELDS = {"type", "description", "properties", "required", "items", "enum", "format", "nullable"}
 
 def _clean_and_convert_schema(schema: dict) -> dict:
+    """递归清洗 Schema，彻底防范第三方客户端发送的不规范数据导致 Google gRPC 崩溃"""
     if not isinstance(schema, dict):
         return schema
     
@@ -83,8 +78,8 @@ def _clean_and_convert_schema(schema: dict) -> dict:
                 for pk, pv in v.items():
                     if pk and str(pk).strip() and pv is not None:
                         cleaned_props[str(pk)] = _clean_and_convert_schema(pv)
-                if cleaned_props:
-                    new_schema[k] = cleaned_props
+                # 保留空的 properties，稍后在外层统一做决策
+                new_schema[k] = cleaned_props
         elif k == "items":
             if isinstance(v, dict):
                 cleaned_items = _clean_and_convert_schema(v)
@@ -103,14 +98,14 @@ def _clean_and_convert_schema(schema: dict) -> dict:
         else:
             new_schema[k] = v
             
+    # 自动推断缺失的 type，但绝不盲目兜底为 STRING！
     if "type" not in new_schema:
         if "properties" in new_schema:
             new_schema["type"] = "OBJECT"
         elif "items" in new_schema:
             new_schema["type"] = "ARRAY"
-        else:
-            new_schema["type"] = "STRING"
             
+    # 防止 required 引用了不存在的属性导致校验失败
     if "required" in new_schema:
         if "properties" in new_schema:
             valid_reqs = [r for r in new_schema["required"] if r in new_schema["properties"]]
@@ -169,7 +164,6 @@ def _convert_messages_to_contents(messages: list) -> tuple:
         
         parts = []
         
-        # 1. 还原 Function Response (属于 user 角色)
         if role == "tool":
             gemini_role = "user" 
             tool_output_data = {}
@@ -200,13 +194,11 @@ def _convert_messages_to_contents(messages: list) -> tuple:
                 "name": msg.name or "unknown",
                 "response": tool_output_data
             }
-            # 🎯 修复点1：精准拦截本地假ID(包含chatcmpl-studio-)，真实ID(即使是以call_开头)一律放行给谷歌
             if real_tool_id and "chatcmpl-studio-" not in real_tool_id:
                 func_resp["id"] = real_tool_id
                 
             parts.append({"functionResponse": func_resp})
             
-        # 2. 还原 Function Call 历史 (属于 model 角色)
         elif role == "assistant" and getattr(msg, "tool_calls", None):
             gemini_role = "model"
             for tool_call in msg.tool_calls:
@@ -233,7 +225,6 @@ def _convert_messages_to_contents(messages: list) -> tuple:
                     "name": func_data.get("name", "unknown"),
                     "args": args_dict
                 }
-                # 🎯 修复点1同理：完美保留原生 ID 防断链
                 if real_tool_id and "chatcmpl-studio-" not in real_tool_id:
                     func_call["id"] = real_tool_id
                     
@@ -246,7 +237,6 @@ def _convert_messages_to_contents(messages: list) -> tuple:
             if content:
                 parts.append({"text": str(content)})
                 
-        # 3. 正常聊天内容
         else:
             gemini_role = "user" if role == "user" else "model"
             if isinstance(content, str):
@@ -318,7 +308,6 @@ def _build_batch_graphql_body(project_id: str, model_name: str, request: OpenAIR
         "safetySettings": safety_settings,
     }
     
-    # 🎯 修复点3：规范 systemInstruction 的结构，带上 role
     if system_text:
         variables["systemInstruction"] = {"role": "system", "parts": [{"text": system_text}]}
         
@@ -343,8 +332,11 @@ def _build_batch_graphql_body(project_id: str, model_name: str, request: OpenAIR
                     if isinstance(parameters, dict):
                         parameters = _clean_and_convert_schema(parameters)
                         
-                    # 🎯 修复点2：废除强塞空属性！如果没有参数，就让它为空，斩断“你好”也会引发幻觉调用的祸根
-                    if parameters:
+                    # 🎯 核心修复：如果 parameters 被洗完后是个空壳，或者压根没有 properties
+                    # 绝对不能乱塞 "type": "STRING"，直接完全丢弃 parameters 字段！
+                    # 谷歌 API 规定：无参数工具直接不传 parameters 字段即可！
+                    if parameters and parameters.get("properties"):
+                        parameters["type"] = "OBJECT"
                         declaration["parameters"] = parameters
                         
                     function_declarations.append(declaration)
