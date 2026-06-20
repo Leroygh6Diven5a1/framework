@@ -4,7 +4,6 @@ batchGraphql 直连代理上游通道
 基于 Agent Platform Studio Express Mode 的 batchGraphql 协议实现。
 无需无头浏览器，直接通过 Cookie + SAPISIDHASH 鉴权调用 batchGraphql 端点。
 支持完整的 Function Calling (工具调用) 与 Google Search。
-内置终极防弹 Schema 清洗器、相邻消息合并、以及【思考签名(thoughtSignature)精准回放技术】。
 """
 
 import json
@@ -13,6 +12,7 @@ import uuid
 import asyncio
 import httpx
 import traceback
+import sys
 from typing import Any, Optional, List, Dict, AsyncGenerator
 from fastapi import Request
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -175,20 +175,38 @@ def _convert_messages_to_contents(messages: list) -> tuple:
             gemini_role = "user" 
             tool_output_data = {}
             try:
-                if isinstance(content, str) and (content.strip().startswith("{") or content.strip().startswith("[")):
-                    tool_output_data = json.loads(content)
+                if isinstance(content, str):
+                    stripped = content.strip()
+                    if stripped.startswith("{"):
+                        tool_output_data = json.loads(stripped)
+                        if not isinstance(tool_output_data, dict):
+                            tool_output_data = {"result": tool_output_data}
+                    elif stripped.startswith("["):
+                        tool_output_data = {"result": json.loads(stripped)}
+                    else:
+                        tool_output_data = {"result": content}
                 else:
                     tool_output_data = {"result": content}
             except json.JSONDecodeError:
                 tool_output_data = {"result": str(content)}
             
+            # 🎯 精准解析 ID，绝不牵连 Signature
+            tool_call_id_str = getattr(msg, "tool_call_id", "") or ""
+            real_tool_id = ""
+            if "__thought__" in tool_call_id_str:
+                real_tool_id = tool_call_id_str.split("__thought__")[0]
+            else:
+                real_tool_id = tool_call_id_str
+
             func_resp = {
                 "name": msg.name or "unknown",
                 "response": tool_output_data
             }
-            # 🛡️ 严防 1：在这里绝不能传入 id 或者 thoughtSignature，否则谷歌会直接爆 invalid argument
-            part_dict = {"functionResponse": func_resp}
-            parts.append(part_dict)
+            # ✅ 把真实 ID 还给它，满足 3.5-flash 的并行匹配要求
+            if real_tool_id and not real_tool_id.startswith("call_"):
+                func_resp["id"] = real_tool_id
+                
+            parts.append({"functionResponse": func_resp})
             
         # 2. 还原 Function Call 历史 (属于 model 角色)
         elif role == "assistant" and getattr(msg, "tool_calls", None):
@@ -198,23 +216,31 @@ def _convert_messages_to_contents(messages: list) -> tuple:
                 args_str = func_data.get("arguments", "{}")
                 try:
                     args_dict = json.loads(args_str)
+                    if not isinstance(args_dict, dict):
+                        args_dict = {}
                 except json.JSONDecodeError:
                     args_dict = {}
                 
                 tool_call_id_str = tool_call.get("id", "")
+                real_tool_id = ""
                 thought_sig = ""
                 if "__thought__" in tool_call_id_str:
                     parts_id = tool_call_id_str.split("__thought__")
-                    # 剥离出我们临时藏在 ID 里的 base64 思考签名
+                    real_tool_id = parts_id[0]
                     thought_sig = parts_id[1] if len(parts_id) > 1 else ""
+                else:
+                    real_tool_id = tool_call_id_str
                     
                 func_call = {
                     "name": func_data.get("name", "unknown"),
                     "args": args_dict
                 }
-                # 🛡️ 严防 2：绝不把我们本地自创的假 call_ 形式 ID 发给谷歌，防旧模型报错
+                # ✅ 同样把真实 ID 还给模型历史
+                if real_tool_id and not real_tool_id.startswith("call_"):
+                    func_call["id"] = real_tool_id
+                    
                 part_dict = {"functionCall": func_call}
-                # 🎯 精准回放：思考签名必须且只能塞进原生的 model (assistant) 部分
+                # ✅ 只把签名放进模型历史中，且必须是驼峰命名
                 if thought_sig:
                     part_dict["thoughtSignature"] = thought_sig
                     
@@ -255,6 +281,9 @@ def _convert_messages_to_contents(messages: list) -> tuple:
                 contents[-1]["parts"].extend(parts)
             else:
                 contents.append({"role": gemini_role, "parts": parts})
+                
+    if not contents:
+        contents.append({"role": "user", "parts": [{"text": "继续"}]})
     
     system_text = "\n".join(system_parts) if system_parts else None
     return contents, system_text
@@ -270,18 +299,13 @@ def _build_batch_graphql_body(project_id: str, model_name: str, request: OpenAIR
         "maxOutputTokens": request.max_tokens if request.max_tokens is not None else 65535,
     }
     
-    # 🛡️ 严防 3：动态适配思考配置，防 2.5 级等旧版模型因不识别 thinkingLevel 字段爆 invalid argument
-    if "gemini-3" in model_name:
-        gen_config["thinkingConfig"] = {
-            "thinkingLevel": "HIGH", 
-            "includeThoughts": True
-        }
-    elif "gemini-2.5" in model_name:
-        # 2.5 模型仅支持用 Token 数作为预算单位的 thinkingBudget
-        gen_config["thinkingConfig"] = {
-            "thinkingBudget": 4096, 
-            "includeThoughts": True
-        }
+    is_image_model = "image" in model_name.lower() or "imagen" in model_name.lower()
+    
+    if not is_image_model:
+        if "gemini-3" in model_name:
+            gen_config["thinkingConfig"] = {"thinkingLevel": "HIGH", "includeThoughts": True}
+        elif "gemini-2.5" in model_name:
+            gen_config["thinkingConfig"] = {"thinkingBudget": 4096, "includeThoughts": True}
     
     safety_settings = [
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
@@ -428,7 +452,6 @@ def _extract_from_results(obj: dict):
             for part in parts:
                 func_call = part.get("functionCall")
                 if func_call:
-                    # 提取并记录原始的 thoughtSignature
                     sig = part.get("thoughtSignature") or part.get("thought_signature") or ""
                     yield ("function_call", {"call": func_call, "sig": sig})
                     continue
@@ -475,8 +498,12 @@ async def _execute_stream_request(client, headers, body, model_display, response
     events = []
     has_content = False
     has_tool_call = False
-
-    print("\n========== 🕵️‍♂️ 发送给谷歌的终极 JSON 载荷 ==========\n", json.dumps(body, indent=2, ensure_ascii=False), "\n======================================================\n")
+    
+    # 加入了强制刷新的打印，如果依然报错，这次绝对能截获案发 JSON！
+    print("\n" + "="*20 + " 🕵️‍♂️ SENDING JSON TO GOOGLE " + "="*20)
+    print(json.dumps(body, indent=2, ensure_ascii=False))
+    print("="*60 + "\n", flush=True)
+    
     try:
         async with client.stream("POST", BATCH_GRAPHQL_URL, headers=headers, json=body) as response:
             if response.status_code != 200:
