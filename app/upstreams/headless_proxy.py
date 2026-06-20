@@ -3,7 +3,7 @@ batchGraphql 直连代理上游通道
 
 基于 Agent Platform Studio Express Mode 的 batchGraphql 协议实现。
 无需无头浏览器，直接通过 Cookie + SAPISIDHASH 鉴权调用 batchGraphql 端点。
-支持完整的 Function Calling (工具调用) 与 Google Search，并自动处理 Schema 类型大写转换。
+支持完整的 Function Calling (工具调用) 与 Google Search，并自动清洗 Schema 字段防静默丢弃。
 """
 
 import json
@@ -30,7 +30,7 @@ from cookie_auth import (
 
 # ========== 重试配置 ==========
 MAX_RETRIES = 10
-RETRY_BACKOFF = [5] * 10  # 每次重试等待秒数
+RETRY_BACKOFF = [5] * 10
 
 RETRYABLE_KEYWORDS = [
     "resource exhausted", "try again later", "429", "quota", 
@@ -49,38 +49,49 @@ COOKIE_REFRESH_HINT = (
     "按 F12 打开控制台，复制 Request Headers 中的 Cookie，然后到大盘粘贴新 Cookie。"
 )
 
-
 def _is_retryable_error(error_msg: str) -> bool:
     lower = error_msg.lower()
     return any(kw in lower for kw in RETRYABLE_KEYWORDS)
-
 
 def _is_cookie_expired_error(error_msg: str) -> bool:
     lower = error_msg.lower()
     return any(kw in lower for kw in COOKIE_EXPIRED_KEYWORDS)
 
 
-# ========== Schema 类型转换辅助函数 ==========
-def _convert_schema_types_to_uppercase(schema: dict) -> dict:
-    """递归将 JSON Schema 中的 type 字段转换为大写，以适配 Vertex batchGraphql 的 Enum 限制"""
+# ========== Schema 清洗与类型转换辅助函数 ==========
+# 严格限制谷歌支持的 Schema 字段，防静默丢弃
+ALLOWED_SCHEMA_FIELDS = {"type", "description", "properties", "required", "items", "enum", "format", "nullable"}
+
+def _clean_and_convert_schema(schema: dict) -> dict:
+    """递归清洗 Schema，转大写并剔除 Gemini 不支持的字段（如 additionalProperties），防止大模型后端静默丢弃工具"""
     if not isinstance(schema, dict):
         return schema
     
     new_schema = {}
     for k, v in schema.items():
-        if k == "type" and isinstance(v, str):
-            new_schema[k] = v.upper()
+        if k not in ALLOWED_SCHEMA_FIELDS:
+            continue  # 剔除不支持的字段
+            
+        if k == "type":
+            if isinstance(v, str):
+                new_schema[k] = v.upper()
+            elif isinstance(v, list) and len(v) > 0:
+                new_schema[k] = str(v[0]).upper()
         elif k == "properties" and isinstance(v, dict):
-            new_schema[k] = {pk: _convert_schema_types_to_uppercase(pv) for pk, pv in v.items()}
+            new_schema[k] = {pk: _clean_and_convert_schema(pv) for pk, pv in v.items()}
         elif k == "items" and isinstance(v, dict):
-            new_schema[k] = _convert_schema_types_to_uppercase(v)
+            new_schema[k] = _clean_and_convert_schema(v)
         else:
             new_schema[k] = v
+            
+    # 如果存在 properties 但没写 type，强制补全为 OBJECT
+    if "properties" in new_schema and "type" not in new_schema:
+        new_schema["type"] = "OBJECT"
+        
     return new_schema
 
 
 # ========== requestContext 模板 ==========
-
 def _get_experiment_flags() -> str:
     if app_config.EXPERIMENT_FLAGS:
         return app_config.EXPERIMENT_FLAGS
@@ -92,7 +103,6 @@ def _get_experiment_flags() -> str:
             if flags:
                 return flags
     return ""
-
 
 def _build_request_context(project_id: str) -> dict:
     return {
@@ -109,9 +119,7 @@ def _build_request_context(project_id: str) -> dict:
         "localizationData": {"locale": "zh_CN", "timezone": "Asia/Hong_Kong"}
     }
 
-
 # ========== OpenAI → batchGraphql 消息格式转换 ==========
-
 def _convert_messages_to_contents(messages: list) -> tuple:
     contents = []
     system_parts = []
@@ -129,7 +137,8 @@ def _convert_messages_to_contents(messages: list) -> tuple:
         
         # 1. 处理传入的函数调用结果 (OpenAI role="tool")
         if role == "tool":
-            gemini_role = "function"
+            # 关键修改：Gemini 处理历史工具回调时，最好放在 user 角色下，避免被过滤
+            gemini_role = "user" 
             tool_output_data = {}
             try:
                 if isinstance(content, str) and (content.strip().startswith("{") or content.strip().startswith("[")):
@@ -162,7 +171,6 @@ def _convert_messages_to_contents(messages: list) -> tuple:
                         "args": args_dict
                     }
                 })
-            # 如果同时还带有文本（如思考过程），也一并附上
             if content:
                 parts.append({"text": str(content)})
                 
@@ -211,10 +219,7 @@ def _build_batch_graphql_body(project_id: str, model_name: str, request: OpenAIR
     }
     
     if any(kw in model_name for kw in ("gemini-3", "gemini-2.5")):
-        gen_config["thinkingConfig"] = {
-            "thinkingLevel": "HIGH",
-            "includeThoughts": True
-        }
+        gen_config["thinkingConfig"] = {"thinkingLevel": "MEDIUM", "includeThoughts": True}
     
     safety_settings = [
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
@@ -232,7 +237,6 @@ def _build_batch_graphql_body(project_id: str, model_name: str, request: OpenAIR
     
     if system_text:
         variables["systemInstruction"] = {"parts": [{"text": system_text}]}
-    
     if request.stop:
         gen_config["stopSequences"] = request.stop if isinstance(request.stop, list) else [request.stop]
     
@@ -252,11 +256,10 @@ def _build_batch_graphql_body(project_id: str, model_name: str, request: OpenAIR
                     }
                     parameters = func_data.get("parameters")
                     if isinstance(parameters, dict):
-                        parameters = parameters.copy()
-                        if "$schema" in parameters:
-                            del parameters["$schema"]
-                        # 在这里调用我们新增的大写转换函数
-                        parameters = _convert_schema_types_to_uppercase(parameters)
+                        # 洗掉不支持的字段，转换格式
+                        parameters = _clean_and_convert_schema(parameters)
+                        if "type" not in parameters:
+                            parameters["type"] = "OBJECT"
                         declaration["parameters"] = parameters
                     function_declarations.append(declaration)
         if function_declarations:
@@ -276,7 +279,8 @@ def _build_batch_graphql_body(project_id: str, model_name: str, request: OpenAIR
         allowed_functions = None
         if isinstance(choice, str):
             if choice == "none": mode = "NONE"
-            elif choice == "auto": mode = "AUTO"
+            elif choice in ["auto", "auto_call"]: mode = "AUTO"
+            elif choice == "required": mode = "ANY"
         elif isinstance(choice, dict) and choice.get("type") == "function":
             func_name = choice.get("function", {}).get("name")
             if func_name:
@@ -297,9 +301,7 @@ def _build_batch_graphql_body(project_id: str, model_name: str, request: OpenAIR
     
     return body
 
-
 # ========== batchGraphql 流式响应解析 ==========
-
 async def _iter_json_objects(response) -> AsyncGenerator[dict, None]:
     buffer = ""
     async for chunk in response.aiter_text():
@@ -367,7 +369,6 @@ def _extract_from_results(obj: dict):
             parts = content_obj.get("parts") or []
             
             for part in parts:
-                # 捕获 Function Calling
                 func_call = part.get("functionCall")
                 if func_call:
                     yield ("function_call", func_call)
@@ -391,15 +392,7 @@ def _extract_from_results(obj: dict):
                 yield ("finish", finish_reason)
 
 
-def _make_openai_chunk(
-    response_id: str,
-    model: str,
-    content: str = None,
-    reasoning_content: str = None,
-    finish_reason: str = None,
-    role: str = None,
-    tool_calls: list = None,
-) -> str:
+def _make_openai_chunk(response_id: str, model: str, content: str = None, reasoning_content: str = None, finish_reason: str = None, role: str = None, tool_calls: list = None) -> str:
     delta = {}
     if role: delta["role"] = role
     if content is not None: delta["content"] = content
@@ -411,21 +404,13 @@ def _make_openai_chunk(
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": delta,
-            "finish_reason": finish_reason,
-        }]
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
     }
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
-def _get_cookie_string() -> str:
-    return app_config.GOOGLE_COOKIE or app_state.get_google_cookie() or ""
-
-def _get_project_id() -> str:
-    return app_config.GOOGLE_PROJECT_ID or app_state.get_project_id() or ""
-
+def _get_cookie_string() -> str: return app_config.GOOGLE_COOKIE or app_state.get_google_cookie() or ""
+def _get_project_id() -> str: return app_config.GOOGLE_PROJECT_ID or app_state.get_project_id() or ""
 
 async def _execute_stream_request(client, headers, body, model_display, response_id, attempt):
     events = []
@@ -459,23 +444,12 @@ async def _execute_stream_request(client, headers, body, model_display, response
                         func_name = data.get("name", "unknown")
                         args_dict = data.get("args", {})
                         tool_call_id = f"call_{response_id}_{int(time.time()*1000)}_{func_name}"
-                        tc = [{
-                            "index": 0,
-                            "id": tool_call_id,
-                            "type": "function",
-                            "function": {
-                                "name": func_name,
-                                "arguments": json.dumps(args_dict, ensure_ascii=False)
-                            }
-                        }]
+                        tc = [{"index": 0, "id": tool_call_id, "type": "function", "function": {"name": func_name, "arguments": json.dumps(args_dict, ensure_ascii=False)}}]
                         events.append(_make_openai_chunk(response_id, model_display, tool_calls=tc))
                         has_content = True
                         has_tool_call = True
                     elif event_type == "finish":
-                        if has_tool_call:
-                            fr = "tool_calls"
-                        else:
-                            fr = "stop" if data == "STOP" else "length" if data == "MAX_TOKENS" else "stop"
+                        fr = "tool_calls" if has_tool_call else ("stop" if data == "STOP" else "length" if data == "MAX_TOKENS" else "stop")
                         events.append(_make_openai_chunk(response_id, model_display, finish_reason=fr))
                     elif event_type == "error":
                         err_msg = data.get("message", str(data)) if isinstance(data, dict) else str(data)
@@ -495,32 +469,21 @@ async def _execute_stream_request(client, headers, body, model_display, response
         print(f"{'⚠️' if is_retryable else '❌'} [Studio] 异常 (尝试 {attempt+1}): {err_msg[:150]}")
         return False, [], err_msg, is_retryable
 
-
 class HeadlessProxyUpstream(BaseUpstream):
     async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request):
         cookie_str = _get_cookie_string()
-        if not cookie_str:
-            return JSONResponse(status_code=401, content={"error": {"message": "未配置 Google Cookie。", "type": "auth_error"}})
-        
+        if not cookie_str: return JSONResponse(status_code=401, content={"error": {"message": "未配置 Google Cookie。", "type": "auth_error"}})
         project_id = _get_project_id()
-        if not project_id:
-            return JSONResponse(status_code=400, content={"error": {"message": "未配置 Google Cloud Project ID。", "type": "config_error"}})
-        
+        if not project_id: return JSONResponse(status_code=400, content={"error": {"message": "未配置 Google Cloud Project ID。", "type": "config_error"}})
         headers = build_headers(cookie_str)
-        if not headers:
-            return JSONResponse(status_code=401, content={"error": {"message": "Cookie 中未找到 SAPISID，无法计算认证头。", "type": "auth_error"}})
+        if not headers: return JSONResponse(status_code=401, content={"error": {"message": "Cookie 中未找到 SAPISID，无法计算认证头。", "type": "auth_error"}})
         
         model_display = request_obj.model
         base_model_name = model_display
-        if base_model_name.endswith("-search"):
-            base_model_name = base_model_name[:-len("-search")]
+        if base_model_name.endswith("-search"): base_model_name = base_model_name[:-len("-search")]
         
-        client_kwargs = {
-            "timeout": httpx.Timeout(connect=30.0, read=180.0, write=30.0, pool=10.0),
-            "follow_redirects": True,
-        }
-        if app_config.PROXY_URL:
-            client_kwargs["proxy"] = app_config.PROXY_URL
+        client_kwargs = {"timeout": httpx.Timeout(connect=30.0, read=180.0, write=30.0, pool=10.0), "follow_redirects": True}
+        if app_config.PROXY_URL: client_kwargs["proxy"] = app_config.PROXY_URL
         
         is_stream = request_obj.stream
         response_id = f"chatcmpl-studio-{int(time.time())}"
@@ -538,24 +501,18 @@ class HeadlessProxyUpstream(BaseUpstream):
                     req_headers = build_headers(_get_cookie_string()) or headers
                     
                     async with httpx.AsyncClient(**client_kwargs) as client:
-                        success, events, error_msg, is_retryable = await _execute_stream_request(
-                            client, req_headers, body, model_display, response_id, attempt
-                        )
+                        success, events, error_msg, is_retryable = await _execute_stream_request(client, req_headers, body, model_display, response_id, attempt)
                     
                     if success:
                         elapsed = time.time() - start_time
                         print(f"✅ [Studio] {base_model_name} | {len(events)} 块 | {elapsed:.1f}s")
-                        
                         yield _make_openai_chunk(response_id, model_display, role="assistant")
                         for event in events: yield event
                         
                         has_finish = any('"finish_reason":' in e and ('"stop"' in e or '"length"' in e or '"tool_calls"' in e) for e in events)
-                        if not has_finish:
-                            yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
-                        
+                        if not has_finish: yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
                         yield "data: [DONE]\n\n"
                         return
-                    
                     elif is_retryable and attempt < MAX_RETRIES:
                         wait_sec = RETRY_BACKOFF[attempt] if attempt < len(RETRY_BACKOFF) else RETRY_BACKOFF[-1]
                         print(f"🔄 [Studio] {wait_sec}s 后重试 ({attempt+2}/{MAX_RETRIES+1})...")
@@ -566,15 +523,12 @@ class HeadlessProxyUpstream(BaseUpstream):
                         elapsed = time.time() - start_time
                         if attempt >= MAX_RETRIES: print(f"❌ [Studio] {base_model_name} | 重试 {MAX_RETRIES} 次后仍失败 | {elapsed:.1f}s")
                         else: print(f"❌ [Studio] {base_model_name} | 不可重试错误 | {elapsed:.1f}s")
-                        
                         yield _make_openai_chunk(response_id, model_display, role="assistant")
                         yield _make_openai_chunk(response_id, model_display, content=f"[Studio 错误] {error_msg[:500]}")
                         yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
                         yield "data: [DONE]\n\n"
                         return
-            
             return StreamingResponse(stream_generator(), media_type="text/event-stream")
-        
         else:
             for attempt in range(MAX_RETRIES + 1):
                 try:
@@ -589,7 +543,6 @@ class HeadlessProxyUpstream(BaseUpstream):
                         print(f"⚠️ [Studio] HTTP {response.status_code} (尝试 {attempt+1}), {wait_sec}s 后重试...")
                         await asyncio.sleep(wait_sec)
                         continue
-                    
                     if response.status_code != 200:
                         elapsed = time.time() - start_time
                         print(f"❌ [Studio] {base_model_name} | HTTP {response.status_code} | {elapsed:.1f}s")
@@ -614,18 +567,12 @@ class HeadlessProxyUpstream(BaseUpstream):
                                 func_name = data.get("name", "unknown")
                                 args_dict = data.get("args", {})
                                 tool_call_id = f"call_{response_id}_{int(time.time()*1000)}_{func_name}"
-                                tool_calls_list.append({
-                                    "id": tool_call_id,
-                                    "type": "function",
-                                    "function": {"name": func_name, "arguments": json.dumps(args_dict, ensure_ascii=False)}
-                                })
+                                tool_calls_list.append({"id": tool_call_id, "type": "function", "function": {"name": func_name, "arguments": json.dumps(args_dict, ensure_ascii=False)}})
                             elif event_type == "finish":
                                 if data == "MAX_TOKENS": finish_reason = "length"
                             elif event_type == "error":
                                 err_msg = data.get("message", str(data)) if isinstance(data, dict) else str(data)
-                                if _is_retryable_error(err_msg) and attempt < MAX_RETRIES:
-                                    api_error = err_msg
-                                    break
+                                if _is_retryable_error(err_msg) and attempt < MAX_RETRIES: api_error = err_msg; break
                                 full_text += f"\n[错误] {err_msg}"
                     
                     if api_error and attempt < MAX_RETRIES:
@@ -635,27 +582,21 @@ class HeadlessProxyUpstream(BaseUpstream):
                         continue
                     
                     elapsed = time.time() - start_time
-                    text_len = len(full_text)
-                    print(f"✅ [Studio] {base_model_name} | {text_len} 字符 | {len(tool_calls_list)} 个工具调用 | {elapsed:.1f}s")
+                    print(f"✅ [Studio] {base_model_name} | {len(full_text)} 字符 | {len(tool_calls_list)} 个工具调用 | {elapsed:.1f}s")
                     
                     if tool_calls_list: finish_reason = "tool_calls"
                     
                     message_obj = {"role": "assistant"}
                     if full_text.strip(): message_obj["content"] = full_text
                     else: message_obj["content"] = None
-                    
                     if reasoning_text: message_obj["reasoning_content"] = reasoning_text
                     if tool_calls_list: message_obj["tool_calls"] = tool_calls_list
                     
                     return JSONResponse(content={
-                        "id": response_id,
-                        "object": "chat.completion",
-                        "created": int(time.time()),
-                        "model": model_display,
-                        "choices": [{"index": 0, "message": message_obj, "finish_reason": finish_reason}],
+                        "id": response_id, "object": "chat.completion", "created": int(time.time()),
+                        "model": model_display, "choices": [{"index": 0, "message": message_obj, "finish_reason": finish_reason}],
                         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
                     })
-                
                 except Exception as e:
                     err_msg = str(e)
                     is_retryable = _is_retryable_error(err_msg) or "timeout" in err_msg.lower()
@@ -664,7 +605,6 @@ class HeadlessProxyUpstream(BaseUpstream):
                         print(f"⚠️ [Studio] 异常 (尝试 {attempt+1}): {err_msg[:100]}, {wait_sec}s 后重试...")
                         await asyncio.sleep(wait_sec)
                         continue
-                    
                     elapsed = time.time() - start_time
                     print(f"❌ [Studio] {base_model_name} | 异常 | {elapsed:.1f}s: {err_msg[:150]}")
                     traceback.print_exc()
