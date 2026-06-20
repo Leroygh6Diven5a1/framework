@@ -3,7 +3,7 @@ batchGraphql 直连代理上游通道
 
 基于 Agent Platform Studio Express Mode 的 batchGraphql 协议实现。
 无需无头浏览器，直接通过 Cookie + SAPISIDHASH 鉴权调用 batchGraphql 端点。
-支持完整的 Function Calling (工具调用) 与 Google Search。
+支持完整的 Function Calling (工具调用) 与 Google Search，并自动处理 Schema 类型大写转换。
 """
 
 import json
@@ -58,6 +58,25 @@ def _is_retryable_error(error_msg: str) -> bool:
 def _is_cookie_expired_error(error_msg: str) -> bool:
     lower = error_msg.lower()
     return any(kw in lower for kw in COOKIE_EXPIRED_KEYWORDS)
+
+
+# ========== Schema 类型转换辅助函数 ==========
+def _convert_schema_types_to_uppercase(schema: dict) -> dict:
+    """递归将 JSON Schema 中的 type 字段转换为大写，以适配 Vertex batchGraphql 的 Enum 限制"""
+    if not isinstance(schema, dict):
+        return schema
+    
+    new_schema = {}
+    for k, v in schema.items():
+        if k == "type" and isinstance(v, str):
+            new_schema[k] = v.upper()
+        elif k == "properties" and isinstance(v, dict):
+            new_schema[k] = {pk: _convert_schema_types_to_uppercase(pv) for pk, pv in v.items()}
+        elif k == "items" and isinstance(v, dict):
+            new_schema[k] = _convert_schema_types_to_uppercase(v)
+        else:
+            new_schema[k] = v
+    return new_schema
 
 
 # ========== requestContext 模板 ==========
@@ -232,10 +251,12 @@ def _build_batch_graphql_body(project_id: str, model_name: str, request: OpenAIR
                         "description": func_data.get("description"),
                     }
                     parameters = func_data.get("parameters")
-                    if isinstance(parameters, dict) and "$schema" in parameters:
+                    if isinstance(parameters, dict):
                         parameters = parameters.copy()
-                        del parameters["$schema"]
-                    if parameters:
+                        if "$schema" in parameters:
+                            del parameters["$schema"]
+                        # 在这里调用我们新增的大写转换函数
+                        parameters = _convert_schema_types_to_uppercase(parameters)
                         declaration["parameters"] = parameters
                     function_declarations.append(declaration)
         if function_declarations:
