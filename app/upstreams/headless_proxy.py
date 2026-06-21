@@ -4,12 +4,7 @@ batchGraphql 直连代理上游通道
 基于 Agent Platform Studio Express Mode 的 batchGraphql 协议实现。
 无需无头浏览器，直接通过 Cookie + SAPISIDHASH 鉴权调用 batchGraphql 端点。
 
-请求格式：
-  POST cloudconsole-pa.clients6.google.com/.../batchGraphql?key=...
-  Body: { requestContext, querySignature, operationName, variables }
-
-响应格式：
-  流式返回多个 JSON 对象，每个包含 results[].data.candidates[].content.parts
+支持真正的实时流式响应（防 60s 超时）与 429 智能退避重试。
 """
 
 import json
@@ -102,7 +97,6 @@ def _get_experiment_flags() -> str:
 def _build_request_context(project_id: str) -> dict:
     """
     构建 batchGraphql 的 requestContext
-    
     包含 experimentFlagsBinary，这是 Express Mode 权限的关键标识。
     """
     return {
@@ -123,12 +117,6 @@ def _build_request_context(project_id: str) -> dict:
 # ========== OpenAI → batchGraphql 消息格式转换 ==========
 
 def _convert_messages_to_contents(messages: list) -> tuple:
-    """
-    将 OpenAI messages 转换为 Vertex AI contents 格式
-    
-    Returns:
-        (contents_list, system_instruction_text_or_None)
-    """
     contents = []
     system_parts = []
     
@@ -183,9 +171,7 @@ def _build_batch_graphql_body(
     model_name: str,
     request: OpenAIRequest,
 ) -> dict:
-    """构建完整的 batchGraphql 请求体"""
     contents, system_text = _convert_messages_to_contents(request.messages)
-    
     model_path = f"projects/{project_id}/locations/global/publishers/google/models/{model_name}"
     
     gen_config = {
@@ -223,20 +209,17 @@ def _build_batch_graphql_body(
     if hasattr(request, 'model') and request.model.endswith("-search"):
         variables["tools"] = [{"googleSearch": {}}]
     
-    body = {
+    return {
         "requestContext": _build_request_context(project_id),
         "querySignature": STREAM_GENERATE_QUERY_SIGNATURE,
         "operationName": STREAM_GENERATE_OPERATION_NAME,
         "variables": variables,
     }
-    
-    return body
 
 
 # ========== batchGraphql 流式响应解析 ==========
 
 async def _iter_json_objects(response) -> AsyncGenerator[dict, None]:
-    """从 batchGraphql 流式响应中逐个提取完整 JSON 对象"""
     buffer = ""
     async for chunk in response.aiter_text():
         if not chunk:
@@ -288,11 +271,6 @@ async def _iter_json_objects(response) -> AsyncGenerator[dict, None]:
 
 
 def _extract_from_results(obj: dict):
-    """
-    从 batchGraphql 响应对象中提取文本/图片/错误
-    
-    Yields: (event_type, data)
-    """
     if "error" in obj:
         yield ("error", obj["error"])
         return
@@ -344,7 +322,6 @@ def _make_openai_chunk(
     finish_reason: str = None,
     role: str = None,
 ) -> str:
-    """构建单个 OpenAI SSE chunk"""
     delta = {}
     if role:
         delta["role"] = role
@@ -376,91 +353,77 @@ def _get_project_id() -> str:
     return app_config.GOOGLE_PROJECT_ID or app_state.get_project_id() or ""
 
 
-# ========== 单次请求执行（供重试包装器调用） ==========
+# ========== 单次流式请求执行器（重构为真正的异步实时生成器） ==========
 
-async def _execute_stream_request(
+async def _execute_stream_request_generator(
     client: httpx.AsyncClient,
     headers: dict,
     body: dict,
     model_display: str,
     response_id: str,
-    attempt: int,
-):
+) -> AsyncGenerator[tuple[str, Any], None]:
     """
-    执行单次流式请求，返回 (success, events_list, error_msg, is_retryable)
-    
-    events_list: 成功时的 SSE 事件列表
-    error_msg: 失败时的错误消息
-    is_retryable: 该错误是否可重试
+    异步生成器：真正实时地拉取数据并原样向外抛出。
+    yield (status_type, payload)
     """
-    events = []
     has_content = False
-    retryable_error = None
-    
     try:
-        async with client.stream("POST", BATCH_GRAPHQL_URL,
-                                  headers=headers, json=body) as response:
+        async with client.stream("POST", BATCH_GRAPHQL_URL, headers=headers, json=body) as response:
             
-            # HTTP 级别错误
+            # 1. 拦截 HTTP 状态码错误
             if response.status_code != 200:
                 error_text = await response.aread()
                 error_msg = error_text.decode('utf-8', errors='replace')[:1000]
                 
-                # 401/403 = Cookie 过期
                 if response.status_code in (401, 403) or _is_cookie_expired_error(error_msg):
-                    print(f"🔑 [Studio] HTTP {response.status_code} Cookie 过期/权限错误 (尝试 {attempt+1})")
-                    return False, [], error_msg + COOKIE_REFRESH_HINT, False
+                    yield "cookie_error", error_msg + COOKIE_REFRESH_HINT
+                    return
                 
                 is_retryable = response.status_code in (429, 503, 500) or _is_retryable_error(error_msg)
-                print(f"{'⚠️' if is_retryable else '❌'} [Studio] HTTP {response.status_code} (尝试 {attempt+1}): {error_msg[:150]}")
-                return False, [], error_msg, is_retryable
+                yield "retryable_error" if is_retryable else "fatal_error", error_msg
+                return
             
-            # 解析流式响应
+            # 2. 实时遍历并抛出流式 JSON 事件块
             async for obj in _iter_json_objects(response):
                 for event_type, data in _extract_from_results(obj):
                     if event_type == "text":
-                        events.append(_make_openai_chunk(response_id, model_display, content=data))
+                        yield "chunk", _make_openai_chunk(response_id, model_display, content=data)
                         has_content = True
                     
                     elif event_type == "thought":
-                        events.append(_make_openai_chunk(response_id, model_display, reasoning_content=data))
+                        yield "chunk", _make_openai_chunk(response_id, model_display, reasoning_content=data)
                         has_content = True
                     
                     elif event_type == "image":
-                        events.append(_make_openai_chunk(response_id, model_display, content=data))
+                        yield "chunk", _make_openai_chunk(response_id, model_display, content=data)
                         has_content = True
                     
                     elif event_type == "finish":
                         fr = "stop" if data == "STOP" else "length" if data == "MAX_TOKENS" else "stop"
-                        events.append(_make_openai_chunk(response_id, model_display, finish_reason=fr))
+                        yield "finish", _make_openai_chunk(response_id, model_display, finish_reason=fr)
                     
                     elif event_type == "error":
                         err_msg = data.get("message", str(data)) if isinstance(data, dict) else str(data)
                         
-                        # Cookie 过期/权限失效 → 不可重试，立即返回并提示刷新
+                        # 在还没发送任何有效数据前遇到错误，尝试走顶层重试
                         if _is_cookie_expired_error(err_msg) and not has_content:
-                            print(f"🔑 [Studio] Cookie 过期/权限错误: {err_msg[:150]}")
-                            return False, [], err_msg + COOKIE_REFRESH_HINT, False
-                        
-                        # 429 限流类 → 可重试
+                            yield "cookie_error", err_msg + COOKIE_REFRESH_HINT
+                            return
                         if _is_retryable_error(err_msg) and not has_content:
-                            print(f"⚠️ [Studio] 429/限流 (尝试 {attempt+1}): {err_msg[:150]}")
-                            return False, [], err_msg, True
+                            yield "retryable_error", err_msg
+                            return
                         
-                        # 其他 API 错误，加入事件流
-                        print(f"❌ [Studio] API 错误: {err_msg[:200]}")
-                        events.append(_make_openai_chunk(
-                            response_id, model_display,
-                            content=f"\n[Studio API 错误] {err_msg}"
-                        ))
-            
-            return True, events, None, False
-    
+                        # 如果流已经开始输出才发生错误，直接作为文本信息告知前端
+                        yield "chunk", _make_openai_chunk(response_id, model_display, content=f"\n[Studio API 错误] {err_msg}")
+                        
     except Exception as e:
         err_msg = str(e)
         is_retryable = _is_retryable_error(err_msg) or "timeout" in err_msg.lower()
-        print(f"{'⚠️' if is_retryable else '❌'} [Studio] 异常 (尝试 {attempt+1}): {err_msg[:150]}")
-        return False, [], err_msg, is_retryable
+        if not has_content:
+            yield "retryable_error" if is_retryable else "fatal_error", err_msg
+        else:
+            # 数据传输中途断开
+            yield "chunk", _make_openai_chunk(response_id, model_display, content=f"\n[Studio 网络异常] 连接中断: {err_msg}")
 
 
 # ========== 主代理类 ==========
@@ -468,10 +431,7 @@ async def _execute_stream_request(
 class HeadlessProxyUpstream(BaseUpstream):
     """
     batchGraphql 直连代理
-    
-    使用 Cookie + SAPISIDHASH 鉴权，
-    通过 batchGraphql 端点调用 Agent Platform Studio Express Mode 模型。
-    支持自动重试 429 限流错误。
+    使用 Cookie + SAPISIDHASH 鉴权调用 batchGraphql 端点。
     """
     
     async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request):
@@ -522,66 +482,87 @@ class HeadlessProxyUpstream(BaseUpstream):
         msg_count = len(request_obj.messages)
         print(f"→ [Studio] {base_model_name} | {msg_count} 条消息 | {'流式' if is_stream else '非流式'}")
         
-        # ========== 流式处理（带自动重试） ==========
+        # ========== 流式处理（彻底解决 60s 超时的真·流式机制） ==========
         if is_stream:
             async def stream_generator():
                 nonlocal start_time
                 
                 for attempt in range(MAX_RETRIES + 1):
-                    # 每次重试重新构建请求（新的 requestContext + 新的 SAPISIDHASH）
                     body = _build_batch_graphql_body(project_id, base_model_name, request_obj)
                     req_headers = build_headers(_get_cookie_string()) or headers
                     
                     async with httpx.AsyncClient(**client_kwargs) as client:
-                        success, events, error_msg, is_retryable = await _execute_stream_request(
-                            client, req_headers, body, model_display, response_id, attempt
-                        )
-                    
-                    if success:
-                        # 成功 - 发送 role chunk + 所有事件 + DONE
-                        elapsed = time.time() - start_time
-                        print(f"✅ [Studio] {base_model_name} | {len(events)} 块 | {elapsed:.1f}s")
+                        has_yielded_to_client = False
+                        has_finish_chunk = False
+                        should_retry = False
+                        error_to_raise = None
                         
-                        yield _make_openai_chunk(response_id, model_display, role="assistant")
-                        for event in events:
-                            yield event
+                        # 消费实时生成器
+                        async for status, data in _execute_stream_request_generator(
+                            client, req_headers, body, model_display, response_id
+                        ):
+                            # 如果属于正常的内容块
+                            if status in ("chunk", "finish"):
+                                if not has_yielded_to_client:
+                                    print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
+                                    yield _make_openai_chunk(response_id, model_display, role="assistant")
+                                    has_yielded_to_client = True
+                                
+                                yield data
+                                
+                                if status == "finish":
+                                    has_finish_chunk = True
+                            
+                            # 如果属于 Cookie 权限错误
+                            elif status == "cookie_error":
+                                if not has_yielded_to_client:
+                                    yield _make_openai_chunk(response_id, model_display, role="assistant")
+                                print(f"🔑 [Studio] 权限错误: {data[:150]}")
+                                yield _make_openai_chunk(response_id, model_display, content=f"[Studio 权限错误] {data}")
+                                yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
+                                yield "data: [DONE]\n\n"
+                                return
+                            
+                            # 如果属于其他网络故障或限流错误
+                            elif status in ("retryable_error", "fatal_error"):
+                                # 未发送任何有效数据前发生可重试错误 -> 触发安全退避重试
+                                if not has_yielded_to_client and status == "retryable_error" and attempt < MAX_RETRIES:
+                                    should_retry = True
+                                    error_to_raise = data
+                                    break  # 跳出当前 async for，进入外部循环的 sleep 阶段
+                                else:
+                                    # 如果已经开始了输出，或者错误不可重试，直接抛给前端结束
+                                    if not has_yielded_to_client:
+                                        yield _make_openai_chunk(response_id, model_display, role="assistant")
+                                    
+                                    err_prefix = "不可重试错误" if status == "fatal_error" else "重试耗尽"
+                                    print(f"❌ [Studio] {err_prefix} | {data[:150]}")
+                                    yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio 错误] {data}")
+                                    yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
+                                    yield "data: [DONE]\n\n"
+                                    return
                         
-                        # 确保有 finish chunk
-                        has_finish = any('"finish_reason":' in e and '"stop"' in e or '"length"' in e for e in events)
-                        if not has_finish:
-                            yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
+                        # 如果标记了需要重试，在当前 attempt 结束时等待并开启下一次循环
+                        if should_retry:
+                            wait_sec = RETRY_BACKOFF[attempt] if attempt < len(RETRY_BACKOFF) else RETRY_BACKOFF[-1]
+                            print(f"🔄 [Studio] 遇到可重试拥堵/限流: {error_to_raise[:80]}... {wait_sec}s 后进行第 {attempt+2} 次重试")
+                            await asyncio.sleep(wait_sec)
+                            start_time = time.time()
+                            continue
                         
-                        yield "data: [DONE]\n\n"
-                        return
-                    
-                    elif is_retryable and attempt < MAX_RETRIES:
-                        # 可重试错误 - 等待后重试
-                        wait_sec = RETRY_BACKOFF[attempt] if attempt < len(RETRY_BACKOFF) else RETRY_BACKOFF[-1]
-                        print(f"🔄 [Studio] {wait_sec}s 后重试 ({attempt+2}/{MAX_RETRIES+1})...")
-                        await asyncio.sleep(wait_sec)
-                        start_time = time.time()  # 重置计时
-                        continue
-                    
-                    else:
-                        # 不可重试 或 重试次数用尽
-                        elapsed = time.time() - start_time
-                        if attempt >= MAX_RETRIES:
-                            print(f"❌ [Studio] {base_model_name} | 重试 {MAX_RETRIES} 次后仍失败 | {elapsed:.1f}s")
-                        else:
-                            print(f"❌ [Studio] {base_model_name} | 不可重试错误 | {elapsed:.1f}s")
-                        
-                        yield _make_openai_chunk(response_id, model_display, role="assistant")
-                        yield _make_openai_chunk(
-                            response_id, model_display,
-                            content=f"[Studio 错误] {error_msg[:500]}"
-                        )
-                        yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
-                        yield "data: [DONE]\n\n"
+                        # 完全正常跳出循环
+                        if has_yielded_to_client:
+                            if not has_finish_chunk:
+                                yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
+                            yield "data: [DONE]\n\n"
+                            
+                            elapsed = time.time() - start_time
+                            print(f"✅ [Studio] {base_model_name} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
                         return
             
             return StreamingResponse(stream_generator(), media_type="text/event-stream")
         
-        # ========== 非流式处理（带自动重试） ==========
+        # ========== 非流式处理（逻辑不受影响，保持原生） ==========
         else:
             for attempt in range(MAX_RETRIES + 1):
                 try:
@@ -593,7 +574,6 @@ class HeadlessProxyUpstream(BaseUpstream):
                             BATCH_GRAPHQL_URL, headers=req_headers, json=body
                         )
                     
-                    # HTTP 级别 429
                     if response.status_code in (429, 503, 500):
                         if attempt < MAX_RETRIES:
                             wait_sec = RETRY_BACKOFF[attempt]
@@ -608,7 +588,6 @@ class HeadlessProxyUpstream(BaseUpstream):
                             "error": {"message": response.text[:500], "type": "upstream_error"}
                         })
                     
-                    # 解析响应
                     full_text = ""
                     reasoning_text = ""
                     finish_reason = "stop"
@@ -639,7 +618,6 @@ class HeadlessProxyUpstream(BaseUpstream):
                                     break
                                 full_text += f"\n[错误] {err_msg}"
                     
-                    # 可重试的 API 错误
                     if api_error and attempt < MAX_RETRIES:
                         wait_sec = RETRY_BACKOFF[attempt]
                         print(f"⚠️ [Studio] 429/限流 (尝试 {attempt+1}): {api_error[:100]}, {wait_sec}s 后重试...")
@@ -691,7 +669,6 @@ class HeadlessProxyUpstream(BaseUpstream):
                         "error": {"message": f"batchGraphql proxy error: {err_msg}", "type": "proxy_error"}
                     })
             
-            # 所有重试用尽
             elapsed = time.time() - start_time
             print(f"❌ [Studio] {base_model_name} | 重试 {MAX_RETRIES} 次后仍失败 | {elapsed:.1f}s")
             return JSONResponse(status_code=429, content={
