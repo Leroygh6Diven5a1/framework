@@ -1,8 +1,8 @@
 import json
 import os
-import time
-import asyncio
 import threading
+
+import config as app_config
 
 STATE_FILE = "web_state.json"
 
@@ -10,12 +10,14 @@ class AppState:
     """
     多进程/多线程安全的运行态管理器
     支持 I/O 异常降级，确保在任何 Docker 权限受限环境下都不会发生崩溃
+
+    仅保留 Cookie 直连模式所需的运行态：
+    - use_web_proxy：是否走 Cookie 直连反代通道
+    - google_cookie / google_project_id：Cookie 直连凭证
     """
     def __init__(self):
         self._lock = threading.Lock()
-        self._memory_state = {"use_web_proxy": False, "auth_bundle": {}}
-        self._credential_timestamp = 0  # 凭证最近更新时间戳
-        self._refresh_event = None  # asyncio.Event，用于等待凭证刷新完成
+        self._memory_state = {"use_web_proxy": False}
         self._load_state()
 
     def _load_state(self) -> dict:
@@ -25,7 +27,6 @@ class AppState:
                     data = json.load(f)
                     # 增量安全合并
                     self._memory_state.update(data)
-                    self._credential_timestamp = data.get("credential_timestamp", 0)
             except Exception as e:
                 print(f"⚠️ [状态管理器] 无法读取持久化配置文件，已自动降级为内存模式: {e}")
         return self._memory_state
@@ -48,22 +49,6 @@ class AppState:
         with self._lock:
             state = self._load_state()
             return state.get("use_web_proxy", False)
-
-    def update_auth_bundle(self, bundle: dict):
-        with self._lock:
-            state = self._load_state()
-            state["auth_bundle"] = bundle
-            self._credential_timestamp = time.time()
-            state["credential_timestamp"] = self._credential_timestamp
-            self._save_state(state)
-            print(f"🔄 [状态管理器] 凭证已更新 @ {time.strftime('%H:%M:%S')}")
-        # 通知所有等待者凭证已刷新
-        self._fire_refresh_event()
-
-    def get_auth_bundle(self) -> dict:
-        with self._lock:
-            state = self._load_state()
-            return state.get("auth_bundle", {}).copy()
 
     def set_google_cookie(self, cookie_str: str):
         with self._lock:
@@ -89,69 +74,39 @@ class AppState:
             state = self._load_state()
             return state.get("google_project_id", "")
 
-    # ========== 凭证生命周期管理（新增） ==========
+    # ========== 控制台可调设置 ==========
 
-    def get_credential_age(self) -> float:
-        """获取凭证年龄（秒）"""
-        if self._credential_timestamp == 0:
-            return float('inf')
-        return time.time() - self._credential_timestamp
+    def get_settings(self) -> dict:
+        """返回完整设置（内置默认 + 持久化覆盖），保证所有键都存在。"""
+        with self._lock:
+            state = self._load_state()
+            merged = dict(app_config.DEFAULT_SETTINGS)
+            stored = state.get("settings")
+            if isinstance(stored, dict):
+                merged.update({k: v for k, v in stored.items() if k in merged})
+            return merged
 
-    def is_credential_expired(self, max_age: int = 180) -> bool:
-        """
-        检查凭证是否过期
-        
-        Args:
-            max_age: 最大有效期（秒），默认3分钟
-        """
-        bundle = self.get_auth_bundle()
-        if not bundle or "headers" not in bundle:
-            return True
-        return self.get_credential_age() > max_age
+    def get_setting(self, key: str, default=None):
+        return self.get_settings().get(key, default)
 
-    def get_credential_timestamp(self) -> float:
-        """获取凭证最近更新时间戳"""
-        return self._credential_timestamp
+    def update_settings(self, patch: dict) -> dict:
+        """合并更新设置，只接受已知键，返回更新后的完整设置。"""
+        if not isinstance(patch, dict):
+            return self.get_settings()
+        with self._lock:
+            state = self._load_state()
+            current = state.get("settings")
+            current = dict(current) if isinstance(current, dict) else {}
+            for k, v in patch.items():
+                if k in app_config.DEFAULT_SETTINGS:
+                    current[k] = v
+            state["settings"] = current
+            self._save_state(state)
+            merged = dict(app_config.DEFAULT_SETTINGS)
+            merged.update(current)
+            print(f"🔧 [状态管理器] 已更新 {len(patch)} 项运行时设置。")
+            return merged
 
-    # ========== 异步刷新等待机制 ==========
-
-    def _get_or_create_refresh_event(self) -> asyncio.Event:
-        """获取或创建 refresh event（延迟创建，确保在事件循环中）"""
-        if self._refresh_event is None:
-            try:
-                self._refresh_event = asyncio.Event()
-            except RuntimeError:
-                return None
-        return self._refresh_event
-
-    def _fire_refresh_event(self):
-        """触发刷新完成事件"""
-        if self._refresh_event is not None:
-            self._refresh_event.set()
-
-    async def wait_for_credential_refresh(self, timeout: float = 60) -> bool:
-        """
-        等待凭证刷新完成
-        
-        Args:
-            timeout: 最大等待时间（秒）
-            
-        Returns:
-            是否在超时前获取到新凭证
-        """
-        event = self._get_or_create_refresh_event()
-        if event is None:
-            return False
-        
-        # 先清除事件，等待新的触发
-        event.clear()
-        
-        try:
-            await asyncio.wait_for(event.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            print(f"⚠️ [状态管理器] 等待凭证刷新超时 ({timeout}秒)")
-            return False
 
 # 单例模式导出
 app_state = AppState()

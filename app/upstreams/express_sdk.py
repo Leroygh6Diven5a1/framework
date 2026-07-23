@@ -11,8 +11,10 @@ from api_helpers import (
     execute_gemini_call,
     create_openai_error_response,
 )
-from message_processing import create_gemini_prompt
+from message_processing import create_gemini_prompt, apply_prefill_compat
 from http_options import get_http_options
+import model_capabilities as mc
+from runtime_state import app_state
 
 LEGACY_EXPRESS_PREFIX = "[EXPRESS] "
 LEGACY_PAY_PREFIX = "[PAY]"
@@ -40,45 +42,18 @@ def _normalize_model_name(model_name: str) -> tuple[str, bool, str | None]:
 
 
 def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_image_model: bool) -> dict | None:
+    """按模型能力档案 + 控制台设置 + 单次请求构建思考配置（SDK 线格式）。"""
     if is_image_model:
         return None
 
-    is_thinking_capable = False
-    is_gemini_2_5 = False
-    is_gemini_3_or_above = False
-
-    version_match = re.search(r"gemini-(\d+)\.(\d+)|gemini-(\d+)", base_model_name.lower())
-    if version_match:
-        groups = version_match.groups()
-        major = 0
-        minor_val = 0.0
-
-        if groups[2]:
-            major = int(groups[2])
-        elif groups[0] and groups[1]:
-            major = int(groups[0])
-            try:
-                minor_val = float(groups[1])
-            except ValueError:
-                pass
-
-        if major > 2 or (major == 2 and minor_val >= 5.0):
-            is_thinking_capable = True
-        if major == 2 and minor_val == 5.0:
-            is_gemini_2_5 = True
-        elif major >= 3:
-            is_gemini_3_or_above = True
-
-    if not is_thinking_capable:
+    settings = app_state.get_settings()
+    t = mc.resolve_thinking(base_model_name, request, settings)
+    if t.get("mode") is None:
         return None
 
-    reasoning_effort = getattr(request, "reasoning_effort", None)
-    if not reasoning_effort and hasattr(request, "model_extra") and request.model_extra:
-        reasoning_effort = request.model_extra.get("reasoning_effort")
+    thinking_config = {"include_thoughts": t.get("include_thoughts", True)}
 
-    thinking_config = {"include_thoughts": True}
-
-    if is_gemini_3_or_above:
+    if t["mode"] == "level":
         genai_version_str = getattr(google.genai, "__version__", "1.0.0")
         try:
             parts = genai_version_str.split(".")
@@ -87,19 +62,11 @@ def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_imag
             sdk_supports_level = False
 
         if sdk_supports_level:
-            if reasoning_effort == "low":
-                thinking_config["thinking_level"] = "low"
-            elif reasoning_effort == "medium":
-                thinking_config["thinking_level"] = "medium"
-            else:
-                thinking_config["thinking_level"] = "high"
+            thinking_config["thinking_level"] = t["level"]
         else:
             print(f"⚠️ [推理配置] 当前 google-genai 版本 {genai_version_str} 不支持 thinking_level，已自动跳过该参数。")
-    elif is_gemini_2_5:
-        if reasoning_effort == "low":
-            thinking_config["thinking_budget"] = 1024
-        else:
-            thinking_config["thinking_budget"] = -1
+    else:  # budget（Gemini 2.5）
+        thinking_config["thinking_budget"] = t["budget"]
 
     return thinking_config
 
@@ -146,6 +113,17 @@ class ExpressSDKUpstream(BaseUpstream):
         print(f"🌐 [上游端点] 使用官方 Gemini Express Mode SDK 调用模型 {base_model_name}。")
 
         is_image_model = "image" in request_obj.model.lower()
+
+        # 预填充智能兼容：按控制台模式处理末尾 assistant 预填充（与模型名无关，新模型自动生效）
+        prefill_text = ""
+        _prefill_mode = app_state.get_setting("prefill_mode", "smart")
+        if _prefill_mode != "off":
+            new_msgs, prefill_text = apply_prefill_compat(request_obj.messages, _prefill_mode)
+            if new_msgs is not request_obj.messages:
+                request_obj = request_obj.model_copy(update={"messages": new_msgs})
+            if prefill_text:
+                print(f"🩹 [预填充兼容] 已将末尾 assistant 预填充转为续写指令（{len(prefill_text)} 字），并将拼回输出开头。")
+
         gen_config_dict = create_generation_config(request_obj)
         thinking_config = _build_thinking_config(base_model_name, request_obj, is_image_model)
         if thinking_config:
@@ -159,4 +137,7 @@ class ExpressSDKUpstream(BaseUpstream):
                 gen_config_dict["tools"] = [search_tool]
             print(f"🔎 [搜索增强] 已为模型 {base_model_name} 启用 Google Search 工具。")
 
-        return await execute_gemini_call(client_to_use, base_model_name, create_gemini_prompt, gen_config_dict, request_obj)
+        return await execute_gemini_call(
+            client_to_use, base_model_name, create_gemini_prompt, gen_config_dict, request_obj,
+            fastapi_request=fastapi_request, prefill_text=prefill_text,
+        )

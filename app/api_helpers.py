@@ -21,8 +21,18 @@ from message_processing import (
 import config as app_config
 from config import VERTEX_REASONING_TAG
 
+import model_capabilities as mc
+from runtime_state import app_state
+
 # 引入报错重试统计器
 from logger import stats
+
+
+def _safety_score_enabled() -> bool:
+    try:
+        return bool(app_state.get_setting("safety_score", app_config.SAFETY_SCORE))
+    except Exception:
+        return bool(app_config.SAFETY_SCORE)
 
 class StreamingReasoningProcessor:
     def __init__(self, tag_name: str = VERTEX_REASONING_TAG):
@@ -196,6 +206,16 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
         fmt_type = fmt.get("type", "") if isinstance(fmt, dict) else getattr(fmt, "type", "")
         if fmt_type == "json_object":
             config["response_mime_type"] = "application/json"
+        elif fmt_type == "json_schema":
+            # OpenAI 结构化输出：{"type":"json_schema","json_schema":{"name":...,"schema":{...}}}
+            config["response_mime_type"] = "application/json"
+            json_schema_obj = fmt.get("json_schema") if isinstance(fmt, dict) else getattr(fmt, "json_schema", None)
+            schema = None
+            if isinstance(json_schema_obj, dict):
+                schema = json_schema_obj.get("schema")
+            if isinstance(schema, dict):
+                schema = {k: v for k, v in schema.items() if k != "$schema"}
+                config["response_schema"] = schema
     
     # 官方 2026 最新基准配置
     safety_threshold = "BLOCK_NONE"
@@ -231,71 +251,47 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
         if function_declarations:
             tools_list.append({"function_declarations": function_declarations})
 
-    is_image_model = "image" in request.model.lower()
-    
+    # 读取控制台设置与模型能力档案（优先级：单次请求 > 控制台 > 内置默认）
+    settings = app_state.get_settings()
+    profile = mc.get_profile(request.model)
+    is_image_model = profile["is_image"]
+
     if is_image_model:
         config["response_modalities"] = ["TEXT", "IMAGE"]
-        
-        # 默认不指定比例，开启 API 原生智能自动决策机制
-        target_ar = None
-        
-        req_dict = request.model_dump()
-        size_param = req_dict.get("size")
-        if size_param:
-            if size_param in ["1024x1024", "1:1"]: target_ar = "1:1"
-            elif size_param in ["1024x768", "4:3"]: target_ar = "4:3"
-            elif size_param in ["768x1024", "3:4"]: target_ar = "3:4"
-            elif size_param in ["16:9", "9:16", "21:9", "4:5", "5:4", "3:2", "2:3"]: target_ar = size_param
-            
-        for msg in reversed(request.messages):
-            if msg.role == "user":
-                content = ""
-                if isinstance(msg.content, str): content = msg.content
-                elif isinstance(msg.content, list): content = " ".join([p.get("text", "") for p in msg.content if isinstance(p, dict) and p.get("type") == "text"])
-                
-                # 优先匹配标准生图 --ar，其次匹配独立比例，防非比例数字干扰
-                ar_match = re.search(r"(?i)--ar\s*(\d+[:：]\d+)", content)
-                if not ar_match:
-                    ar_match = re.search(r"\b(\d+[:：]\d+)\b", content)
-                    
-                if ar_match:
-                    parsed_ar = ar_match.group(1).replace("：", ":")
-                    
-                    # 定义生图模型的比例安全白名单
-                    pro_supported = {"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
-                    flash_supported = pro_supported | {"1:4", "4:1", "1:8", "8:1"}
-                    
-                    is_flash_img = "3.1-flash" in request.model.lower()
-                    allowed_set = flash_supported if is_flash_img else pro_supported
-                    
-                    if parsed_ar in allowed_set:
-                        target_ar = parsed_ar
-                    else:
-                        print(f"⚠️ [生图配置] 模型 {request.model} 不支持比例 {parsed_ar}，已交由 Gemini 自动选择比例。")
-                        target_ar = None
-                break
-                
-        # 封装 image_config 结构，强制 4K 级别分辨率
-        image_config_args = {"image_size": "4K"}
+
+        # 宽高比：两通道共用解析（请求额外字段 > OpenAI size 映射 > 提示词 > 控制台默认，按模型白名单校验）
+        target_ar = mc.resolve_aspect_ratio(request.model, request, settings)
+
+        # 分辨率：请求 > 控制台默认，按模型白名单校验并回退
+        image_size = mc.resolve_image_size(request.model, request, settings)
+        image_config_args = {"image_size": image_size}
         if target_ar:
             image_config_args["aspect_ratio"] = target_ar
-            
-        config["image_config"] = types.ImageConfig(**image_config_args)
-        tools_list.append({"google_search": {}})
 
-        unsupported_keys = [
-            "temperature", "top_p", "top_k", "stop_sequences", "seed", 
-            "candidate_count", "presence_penalty", "frequency_penalty", 
-            "response_mime_type", "response_logprobs", "logprobs"
-        ]
-        for key in unsupported_keys:
+        config["image_config"] = types.ImageConfig(**image_config_args)
+        # 生图模型不支持函数调用（官方明确）：丢弃 function_declarations，仅保留搜索
+        tools_list = [{"google_search": {}}]
+
+        # 生图不支持的键（采样类由 sanitize 统一剥离，这里清理其余）
+        for key in ["response_mime_type", "response_schema", "response_logprobs", "logprobs"]:
             config.pop(key, None)
+    else:
+        # 文本/多模态：客户端未显式传采样值时，应用控制台默认（仅注入该模型支持的键）
+        if config.get("temperature") is None and settings.get("default_temperature") is not None:
+            config["temperature"] = settings["default_temperature"]
+        if config.get("top_p") is None and settings.get("default_top_p") is not None:
+            config["top_p"] = settings["default_top_p"]
+        if config.get("max_output_tokens") is None and settings.get("default_max_tokens") is not None:
+            config["max_output_tokens"] = settings["default_max_tokens"]
+
+    # 按模型家族剥离不支持的采样参数（例如 Gemini 3.x 弃用 temperature/top_p/top_k、不支持 candidate_count）
+    mc.sanitize_sampling(config, profile)
 
     if tools_list:
         config["tools"] = tools_list
 
     tool_config = None
-    if request.tool_choice:
+    if request.tool_choice and not is_image_model:
         choice = request.tool_choice
         mode = None
         allowed_functions = None
@@ -325,7 +321,8 @@ def is_gemini_response_valid(response: Any) -> bool:
             if hasattr(cand, "text") and isinstance(cand.text, str) and cand.text.strip(): return True
             if hasattr(cand, "content") and hasattr(cand.content, "parts") and cand.content.parts:
                 for part in cand.content.parts:
-                    if hasattr(part, "function_call"): return True 
+                    if getattr(part, "function_call", None) is not None: return True
+                    if getattr(part, "inline_data", None) is not None: return True
                     if hasattr(part, "text") and isinstance(getattr(part, "text", None), str) and getattr(part, "text", "").strip(): return True
     return False
 
@@ -335,8 +332,8 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
     delta_payload = {}
     openai_finish_reason = None
 
-    if hasattr(chunk, "candidates") and chunk.candidates:
-        candidate = chunk.candidates[0] 
+    if hasattr(chunk, "candidates") and chunk.candidates and len(chunk.candidates) > candidate_index:
+        candidate = chunk.candidates[candidate_index]
         raw_gemini_finish_reason = getattr(candidate, "finish_reason", None)
         if raw_gemini_finish_reason:
             if hasattr(raw_gemini_finish_reason, "name"): raw_gemini_finish_reason_str = raw_gemini_finish_reason.name.upper()
@@ -400,7 +397,7 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
         if not function_call_detected_in_chunk:
             reasoning_text, normal_text = parse_gemini_response_for_reasoning_and_content(candidate)
 
-            if app_config.SAFETY_SCORE and hasattr(candidate, "safety_ratings") and candidate.safety_ratings:
+            if _safety_score_enabled() and hasattr(candidate, "safety_ratings") and candidate.safety_ratings:
                 safety_html = _create_safety_ratings_html(candidate.safety_ratings)
                 if reasoning_text:
                     reasoning_text += safety_html
@@ -498,13 +495,31 @@ async def _chunk_openai_response_dict_for_sse(
 
     yield "data: [DONE]\n\n"
 
-async def gemini_fake_stream_generator( 
-    gemini_client_instance: Any, 
-    model_for_api_call: str, 
+def _prepend_prefill(openai_dict: Dict[str, Any], prefill_text: str) -> Dict[str, Any]:
+    """把预填充文本拼回到最终输出开头（预填充智能兼容用）。"""
+    if not prefill_text:
+        return openai_dict
+    try:
+        for choice in (openai_dict.get("choices") or []):
+            msg = choice.get("message")
+            if not isinstance(msg, dict) or msg.get("tool_calls"):
+                continue
+            existing = msg.get("content")
+            msg["content"] = prefill_text + (existing or "")
+            break
+    except Exception:
+        pass
+    return openai_dict
+
+
+async def gemini_fake_stream_generator(
+    gemini_client_instance: Any,
+    model_for_api_call: str,
     prompt_for_api_call: List[types.Content],
-    gen_config_dict_for_api_call: Dict[str, Any], 
+    gen_config_dict_for_api_call: Dict[str, Any],
     request_obj: OpenAIRequest,
-    is_auto_attempt: bool
+    is_auto_attempt: bool,
+    prefill_text: str = "",
 ):
     print(f"🌊 [假流式] 已开始调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。")
     
@@ -517,7 +532,7 @@ async def gemini_fake_stream_generator(
         )
     )
 
-    outer_keep_alive_interval = app_config.FAKE_STREAMING_INTERVAL_SECONDS
+    outer_keep_alive_interval = app_state.get_setting("fake_streaming_interval", app_config.FAKE_STREAMING_INTERVAL_SECONDS)
     if outer_keep_alive_interval > 0:
         while not api_call_task.done():
             keep_alive_data = {"id": "chatcmpl-keepalive", "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
@@ -535,7 +550,8 @@ async def gemini_fake_stream_generator(
             print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens")
 
         openai_response_dict = convert_to_openai_format(raw_gemini_response, request_obj.model)
-        
+        _prepend_prefill(openai_response_dict, prefill_text)
+
         if hasattr(raw_gemini_response, "prompt_feedback") and \
            hasattr(raw_gemini_response.prompt_feedback, "block_reason") and \
            raw_gemini_response.prompt_feedback.block_reason:
@@ -568,126 +584,190 @@ async def gemini_fake_stream_generator(
         if is_auto_attempt: raise
             
 async def execute_gemini_call(
-    current_client: Any, 
-    model_to_call: str,  
-    prompt_func: Callable[[List[OpenAIMessage]], List[types.Content]], 
-    gen_config_dict: Dict[str, Any], 
-    request_obj: OpenAIRequest, 
-    is_auto_attempt: bool = False
+    current_client: Any,
+    model_to_call: str,
+    prompt_func: Callable[[List[OpenAIMessage]], List[types.Content]],
+    gen_config_dict: Dict[str, Any],
+    request_obj: OpenAIRequest,
+    is_auto_attempt: bool = False,
+    fastapi_request: Optional[Any] = None,
+    prefill_text: str = "",
 ):
     actual_prompt_for_call = prompt_func(request_obj.messages)
-    client_model_name_for_log = getattr(current_client, "model_name", "unknown_direct_client_object")
-    print(f"🚀 [上游请求] 正在调用 Gemini Express Mode 模型 {model_to_call}，客户端请求模型名为 {request_obj.model}。")
-    
+    print(f"🚀 [上游请求] 正在调用 Agent Platform Express Mode 模型 {model_to_call}，客户端请求模型名为 {request_obj.model}。")
+
+    async def _client_gone() -> bool:
+        """检测客户端是否已断开连接（用于在重试前及时止损）。"""
+        if fastapi_request is None:
+            return False
+        try:
+            return await fastapi_request.is_disconnected()
+        except Exception:
+            return False
+
     if request_obj.stream:
         is_image_request = "image" in request_obj.model.lower()
-        
-        if app_config.FAKE_STREAMING_ENABLED or is_image_request:
+
+        if app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED) or is_image_request:
             if is_image_request:
                  print("🖼️ [生图保护] 图片模型请求已自动切换为假流式输出，以避免上游流式限制。")
             return StreamingResponse(
                 gemini_fake_stream_generator(
                     current_client, model_to_call, actual_prompt_for_call,
-                    gen_config_dict, request_obj, is_auto_attempt
+                    gen_config_dict, request_obj, is_auto_attempt, prefill_text=prefill_text,
                 ), media_type="text/event-stream"
             )
         else: # True Streaming
             response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
             async def _gemini_real_stream_generator_inner():
-                max_retries = 20
+                try:
+                    max_retries = int(app_state.get_setting("retry_max", 20))
+                except (TypeError, ValueError):
+                    max_retries = 20
+                has_yielded = False  # 是否已向客户端输出过内容
                 for attempt in range(max_retries):
+                    # 客户端断开则停止重试，避免无谓的上游调用
+                    if await _client_gone():
+                        print(f"ℹ️ [客户端断开] 真流式请求前检测到客户端已断开，停止调用模型 {model_to_call}。")
+                        return
                     try:
                         stream_gen_obj = await current_client.aio.models.generate_content_stream(
-                            model=model_to_call, 
+                            model=model_to_call,
                             contents=actual_prompt_for_call,
                             config=gen_config_dict
                         )
-                        
+
+                        # 预填充智能兼容：把预填充文本作为回复开头先发出（仅一次）
+                        if prefill_text and not has_yielded:
+                            has_yielded = True
+                            _pf = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}]}
+                            yield f"data: {json.dumps(_pf)}\n\n"
+
                         final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
-                        
+
                         async for chunk_item_call in stream_gen_obj:
                             if hasattr(chunk_item_call, "usage_metadata") and chunk_item_call.usage_metadata:
                                 um = chunk_item_call.usage_metadata
                                 final_p_tk = getattr(um, "prompt_token_count", 0) or 0
                                 final_c_tk = getattr(um, "candidates_token_count", 0) or 0
                                 final_t_tk = getattr(um, "total_token_count", final_p_tk + final_c_tk) or (final_p_tk + final_c_tk)
-                                    
-                            yield convert_chunk_to_openai(chunk_item_call, request_obj.model, response_id_for_stream, 0)
-                        
+
+                            # 支持 n>1：按候选序号逐个输出
+                            num_candidates = len(chunk_item_call.candidates) if getattr(chunk_item_call, "candidates", None) else 1
+                            for ci in range(num_candidates):
+                                has_yielded = True
+                                yield convert_chunk_to_openai(chunk_item_call, request_obj.model, response_id_for_stream, ci)
+
                         if final_p_tk > 0 or final_c_tk > 0:
                             print(f"💰 [算力消耗统计] 提示词: {final_p_tk} | 思考与生成: {final_c_tk} | 总计: {final_t_tk} Tokens")
-                            
+
                         yield "data: [DONE]\n\n"
-                        break 
-                        
+                        return
+
                     except asyncio.CancelledError:
                         print(f"ℹ️ [客户端断开] 真流式响应期间客户端已断开，模型 {model_to_call} 的请求已安全终止。")
                         raise
                     except Exception as e_stream_call:
                         error_str = str(e_stream_call).lower()
-                        is_retryable = False
-                        
-                        if "429" in error_str or "503" in error_str or "too many requests" in error_str or "quota" in error_str or "resource exhausted" in error_str:
-                            is_retryable = True
-                            
-                        if is_retryable and attempt < max_retries - 1:
+                        is_retryable = (
+                            "429" in error_str or "503" in error_str or "too many requests" in error_str
+                            or "quota" in error_str or "resource exhausted" in error_str
+                        )
+
+                        # 关键修复：只有在“尚未向客户端输出任何内容”时才重试；
+                        # 否则重试会导致整段答案重复输出（前半段 + 完整重发）。
+                        if is_retryable and not has_yielded and attempt < max_retries - 1:
                             wave_index = attempt % 4
                             round_num = (attempt // 4) + 1
                             wait_time = 2 ** wave_index
                             stats.add_retry() # 核心：手动重试计入大盘
-                            print(f"⚠️ [自动重试] Gemini Express Mode 流式请求返回 429/503 或配额繁忙。第 {round_num} 轮第 {wave_index + 1} 次重试，等待 {wait_time} 秒。")
+                            print(f"⚠️ [自动重试] Agent Platform Express Mode 流式请求返回 429/503 或配额繁忙。第 {round_num} 轮第 {wave_index + 1} 次重试，等待 {wait_time} 秒。")
+                            if await _client_gone():
+                                print(f"ℹ️ [客户端断开] 重试前检测到客户端已断开，停止调用模型 {model_to_call}。")
+                                return
                             await asyncio.sleep(wait_time)
-                            continue 
-                            
+                            continue
+
                         err_msg_detail_stream = f"Gemini 流式请求异常（模型：{model_to_call}）：{type(e_stream_call).__name__} - {str(e_stream_call)}"
                         print(f"❌ [API 错误响应] 流式连接异常中断 (Model: {model_to_call})。错误详情: {err_msg_detail_stream}")
                         s_err = str(e_stream_call); s_err = s_err[:1024]+"..." if len(s_err)>1024 else s_err
-                        err_resp = create_openai_error_response(500,s_err,"server_error")
-                        j_err = json.dumps(err_resp)
-                        if not is_auto_attempt: 
-                            yield f"data: {j_err}\n\n"
+                        if is_auto_attempt:
+                            raise e_stream_call
+                        # 已经输出过内容：不再重发错误体，只补结束标记，避免污染已有输出
+                        if has_yielded:
                             yield "data: [DONE]\n\n"
                         else:
-                            raise e_stream_call
-            
+                            err_resp = create_openai_error_response(500, s_err, "server_error")
+                            yield f"data: {json.dumps(err_resp)}\n\n"
+                            yield "data: [DONE]\n\n"
+                        return
+
             return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream")
     else: # Non-streaming
-        response_obj_call = await execute_with_retry(
-            current_client.aio.models.generate_content,
-            model=model_to_call, 
-            contents=actual_prompt_for_call,
-            config=gen_config_dict
-        )
+        # 手动退避重试循环（替代 tenacity），以便在每次重试前检测客户端断开
+        try:
+            max_retries = int(app_state.get_setting("retry_max", 20))
+        except (TypeError, ValueError):
+            max_retries = 20
+        response_obj_call = None
+        for attempt in range(max_retries):
+            if await _client_gone():
+                print(f"ℹ️ [客户端断开] 非流式请求前检测到客户端已断开，停止调用模型 {model_to_call}。")
+                return JSONResponse(
+                    status_code=499,
+                    content=create_openai_error_response(499, "客户端已断开连接，请求已取消。", "client_closed_request"),
+                )
+            try:
+                response_obj_call = await current_client.aio.models.generate_content(
+                    model=model_to_call,
+                    contents=actual_prompt_for_call,
+                    config=gen_config_dict,
+                )
+                break
+            except asyncio.CancelledError:
+                print(f"ℹ️ [客户端断开] 非流式响应期间客户端已断开，模型 {model_to_call} 的请求已安全终止。")
+                raise
+            except Exception as e_call:
+                if is_retryable_exception(e_call) and attempt < max_retries - 1:
+                    stats.add_retry()
+                    wait_time = min(8, 2 ** (attempt % 4))
+                    print(f"⚠️ [自动重试] 上游繁忙或触发配额限制（{e_call.__class__.__name__}）。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
+                    await asyncio.sleep(wait_time)
+                    continue
+                raise
+
         if hasattr(response_obj_call, "prompt_feedback") and \
            hasattr(response_obj_call.prompt_feedback, "block_reason") and \
            response_obj_call.prompt_feedback.block_reason:
-            block_msg = f"Gemini 安全策略拦截了请求：{response_obj_call.prompt_feedback.block_reason}"
+            block_msg = f"Agent Platform 安全策略拦截了请求：{response_obj_call.prompt_feedback.block_reason}"
             if hasattr(response_obj_call.prompt_feedback,"block_reason_message") and \
-               response_obj_call.prompt_feedback.block_reason_message: 
+               response_obj_call.prompt_feedback.block_reason_message:
                 block_msg+=f"（{response_obj_call.prompt_feedback.block_reason_message}）"
             raise ValueError(block_msg)
-        
+
         if not is_gemini_response_valid(response_obj_call):
-            error_details = f"Gemini 非流式响应无有效内容，模型：{model_to_call}。"
+            error_details = f"Agent Platform 非流式响应无有效内容，模型：{model_to_call}。"
             if hasattr(response_obj_call, "candidates"):
-                error_details += f"Candidates: {len(response_obj_call.candidates) if response_obj_call.candidates else 0}. "
-                if response_obj_call.candidates and len(response_obj_call.candidates) > 0:
-                    candidate = response_obj_call.candidates if isinstance(response_obj_call.candidates, list) else response_obj_call.candidates
+                candidates = response_obj_call.candidates or []
+                error_details += f"Candidates: {len(candidates)}. "
+                if candidates:
+                    candidate = candidates[0]
                     if hasattr(candidate, "content"):
                         error_details += "Has content. "
+                        parts = getattr(candidate.content, "parts", None) or []
                         if hasattr(candidate.content, "parts"):
-                            error_details += f"Parts: {len(candidate.content.parts) if candidate.content.parts else 0}. "
-                            if candidate.content.parts and len(candidate.content.parts) > 0:
-                                part = candidate.content.parts if isinstance(candidate.content.parts, list) else candidate.content.parts
-                                if hasattr(part, "text"):
+                            error_details += f"Parts: {len(parts)}. "
+                            if parts:
+                                part = parts[0]
+                                if getattr(part, "function_call", None) is not None:
+                                    error_details += f"First part is function_call: {part.function_call.name}"
+                                elif hasattr(part, "text"):
                                     text_preview = str(getattr(part, "text", ""))[:100]
                                     error_details += f"First part text: '{text_preview}'"
-                                elif hasattr(part, "function_call"):
-                                    error_details += f"First part is function_call: {part.function_call.name}"
             else:
                 error_details += f"Response type: {type(response_obj_call).__name__}"
             raise ValueError(error_details)
-        
+
         if hasattr(response_obj_call, "usage_metadata") and response_obj_call.usage_metadata:
             um = response_obj_call.usage_metadata
             p_tk = getattr(um, "prompt_token_count", 0) or 0
@@ -696,4 +776,5 @@ async def execute_gemini_call(
             print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens")
 
         openai_response_content = convert_to_openai_format(response_obj_call, request_obj.model)
+        _prepend_prefill(openai_response_content, prefill_text)
         return JSONResponse(content=openai_response_content)

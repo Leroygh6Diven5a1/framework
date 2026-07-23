@@ -16,11 +16,7 @@ class AppSettings(BaseSettings):
     # Cookie direct mode settings (Recommended for cloud deployments like Render)
     GOOGLE_COOKIE: Optional[str] = None         # Google Cookie string
     GOOGLE_PROJECT_ID: Optional[str] = None     # Google Cloud Project ID
-    EXPERIMENT_FLAGS: Optional[str] = None         # experimentFlagsBinary (automatically harvested from browser)
-    
-    # Headless browser settings (Only available for local deployment)
-    HEADLESS_MODE: bool = True
-    CREDENTIAL_REFRESH_INTERVAL: int = 180
+    EXPERIMENT_FLAGS: Optional[str] = None      # experimentFlagsBinary (optional; paste from a console request if needed)
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -46,7 +42,41 @@ SSL_CERT_FILE = _settings.SSL_CERT_FILE
 GOOGLE_COOKIE = _settings.GOOGLE_COOKIE
 GOOGLE_PROJECT_ID = _settings.GOOGLE_PROJECT_ID
 EXPERIMENT_FLAGS = _settings.EXPERIMENT_FLAGS
-HEADLESS_MODE = _settings.HEADLESS_MODE
-CREDENTIAL_REFRESH_INTERVAL = _settings.CREDENTIAL_REFRESH_INTERVAL
 
-VERTEX_REASONING_TAG = "vertex_think_tag"
+REASONING_TAG = "agent_platform_think_tag"
+# 向后兼容别名（历史代码引用 VERTEX_REASONING_TAG）
+VERTEX_REASONING_TAG = REASONING_TAG
+
+
+# ============================================================
+# 控制台可调的运行时默认值（可在大盘热更新，持久化到 web_state.json）
+# 优先级：单次请求 > 控制台设置(这些值) > 代码内置兜底
+# 环境变量仅作为“初始值”。
+# ============================================================
+DEFAULT_SETTINGS = {
+    # 思考
+    "thinking_g3_level": "",              # 空=按模型各自默认(3.6-flash=medium/pro=high/flash-lite=minimal)；也可强制 minimal|low|medium|high
+    "thinking_g25_budget": -1,            # Gemini 2.5 默认思考预算: -1=动态, 0=关(仅flash), 或整数
+    # 生图
+    "image_size": "4K",                   # 默认分辨率: 512|1K|2K|4K（按模型白名单校验）
+    "image_aspect_ratio": "",             # 默认宽高比, ""=自动
+    # 采样默认（客户端未显式传时使用；None=不注入）
+    "default_temperature": None,
+    "default_top_p": None,
+    "default_max_tokens": None,
+    # 输入图片压缩
+    "img_compress_enabled": True,
+    "img_compress_max_dim": 1536,
+    "img_compress_max_mb": 1.5,
+    "img_compress_quality": 85,
+    # 重试
+    "retry_max": 10,
+    "retry_backoff_seconds": 5,
+    # 开关（初始值取环境变量）
+    "fake_streaming": FAKE_STREAMING_ENABLED,
+    "fake_streaming_interval": FAKE_STREAMING_INTERVAL_SECONDS,
+    "roundrobin": ROUNDROBIN,
+    "safety_score": SAFETY_SCORE,
+    # 预填充兼容模式: smart|minimal|off
+    "prefill_mode": "smart",
+}

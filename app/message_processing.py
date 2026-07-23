@@ -7,6 +7,7 @@ import httpx
 import concurrent.futures
 from typing import List, Dict, Any, Tuple
 import config as app_config
+from runtime_state import app_state
 
 from google.genai import types
 from models import OpenAIMessage, ContentPartText, ContentPartImage
@@ -17,15 +18,34 @@ try:
 except ImportError:
     Image = None
 
-def optimize_image_bytes(image_data: bytes, original_mime: str, max_size_bytes: int = int(1.5 * 1024 * 1024)) -> Tuple[bytes, str]:
-    """强效输入图片压缩引擎：超过1.5MB的图强制限制边长至1536px并重采样，避免多轮修图卡死"""
+def optimize_image_bytes(image_data: bytes, original_mime: str, max_size_bytes: int = None) -> Tuple[bytes, str]:
+    """输入图片压缩引擎：可在控制台配置开关/边长/质量/体积阈值。
+    超过阈值的图会限制最长边并重采样，避免多轮修图卡死。"""
     if Image is None:
         return image_data, original_mime
-    
-    # 在安全体积内的图片，原样发送，不损耗一丝画质
+
+    settings = app_state.get_settings()
+    if not settings.get("img_compress_enabled", True):
+        return image_data, original_mime
+
+    if max_size_bytes is None:
+        try:
+            max_size_bytes = int(float(settings.get("img_compress_max_mb", 1.5)) * 1024 * 1024)
+        except (TypeError, ValueError):
+            max_size_bytes = int(1.5 * 1024 * 1024)
+    try:
+        max_dim = int(settings.get("img_compress_max_dim", 1536) or 1536)
+    except (TypeError, ValueError):
+        max_dim = 1536
+    try:
+        quality = int(settings.get("img_compress_quality", 85) or 85)
+    except (TypeError, ValueError):
+        quality = 85
+
+    # 在安全体积内的图片，原样发送，不损耗画质
     if len(image_data) <= max_size_bytes:
         return image_data, original_mime
-        
+
     try:
         with Image.open(io.BytesIO(image_data)) as img:
             # 抹平透明通道以防转成 JPEG 时报错
@@ -38,23 +58,20 @@ def optimize_image_bytes(image_data: bytes, original_mime: str, max_size_bytes: 
                 img = background
             elif img.mode != 'RGB':
                 img = img.convert('RGB')
-            
-            # 强势降维限制：1536px 对于多轮修图的细节识别极度完美，且能瞬间缩减 90% 存储
-            max_dim = 1536
+
             if img.width > max_dim or img.height > max_dim:
                 img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
-            
+
             output = io.BytesIO()
-            # 首选 Q=85 极致画质
-            img.save(output, format='JPEG', quality=85, optimize=True)
+            img.save(output, format='JPEG', quality=quality, optimize=True)
             opt_data = output.getvalue()
-            
-            # 深度二次压缩机制（保证强行锁死在 1.5MB 以下）
+
+            # 二次压缩兜底（锁死在阈值以下）
             if len(opt_data) > max_size_bytes:
                 output = io.BytesIO()
-                img.save(output, format='JPEG', quality=70, optimize=True)
+                img.save(output, format='JPEG', quality=max(40, quality - 15), optimize=True)
                 opt_data = output.getvalue()
-                
+
             return opt_data, "image/jpeg"
     except Exception as e:
         print(f"⚠️ [图片处理] 输入图片压缩失败，已回退为原图传输：{e}")
@@ -98,6 +115,103 @@ def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]
     remaining_text = re.sub(r"[ \t]+", " ", remaining_text).strip()
     return parts, remaining_text
 
+def _coerce_tool_response(content: Any) -> Dict[str, Any]:
+    """把 OpenAI 工具结果安全地转成 function_response 需要的对象。
+
+    修复：旧实现用 `isinstance(str) and (...) or (...)` 的错误优先级，
+    当 content 为 list 时会对其调用 .strip() 抛 AttributeError。
+    """
+    if content is None:
+        return {"result": ""}
+    if not isinstance(content, str):
+        # content 可能是 OpenAI 的分段 list / dict
+        try:
+            return {"result": json.dumps(content, ensure_ascii=False)}
+        except Exception:
+            return {"result": str(content)}
+    s = content.strip()
+    if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+        try:
+            parsed = json.loads(s)
+            # function_response 的 response 需要是对象；数组则包一层
+            return parsed if isinstance(parsed, dict) else {"result": parsed}
+        except json.JSONDecodeError:
+            return {"result": content}
+    return {"result": content}
+
+
+def _message_text(content: Any) -> str:
+    """从 OpenAIMessage.content（str 或分段 list）里提取纯文本。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "text":
+                parts.append(p.get("text", ""))
+            elif hasattr(p, "text") and isinstance(getattr(p, "text", None), str):
+                parts.append(p.text)
+        return "".join(parts)
+    return ""
+
+
+def _is_empty_message(msg: OpenAIMessage) -> bool:
+    if getattr(msg, "tool_calls", None):
+        return False
+    return not _message_text(msg.content).strip()
+
+
+def apply_prefill_compat(messages: List[OpenAIMessage], mode: str = "smart") -> Tuple[List[OpenAIMessage], str]:
+    """
+    预填充(prefill)兼容：Gemini 3.x 拒绝以 assistant/model 结尾的请求（400）。
+
+    - mode="off"：不处理（可能 400）。
+    - mode="minimal"：末尾非 user 时追加一个占位 user，仅保证不报错（不还原预填充）。
+    - mode="smart"：把末尾 assistant 预填充取出，转成末尾 user 的“续写指令”，
+      并返回 prefill 文本，由上游把它拼回输出开头 → 最忠实还原 roleplay 预填充。
+
+    返回 (处理后的消息列表, 需拼回输出开头的预填充文本)。
+    与模型名无关：仅按请求形状触发；新加模型 ID 自动生效。
+    """
+    if not messages or mode == "off":
+        return messages, ""
+
+    # 找到最后一条“非空”消息
+    idx = len(messages) - 1
+    while idx >= 0 and _is_empty_message(messages[idx]):
+        idx -= 1
+    if idx < 0:
+        return messages, ""
+
+    last = messages[idx]
+    if last.role != "assistant" or getattr(last, "tool_calls", None):
+        return messages, ""  # 已是 user 结尾 / 末尾是工具调用 → 无需处理
+
+    prefill = _message_text(last.content).strip()
+    if not prefill:
+        return messages, ""
+
+    if mode == "minimal":
+        new_msgs = list(messages)
+        new_msgs.append(OpenAIMessage(role="user", content="(请继续)"))
+        return new_msgs, ""
+
+    # smart：丢弃末尾预填充 assistant（及其后的空消息），转成续写指令
+    new_msgs = list(messages[:idx])
+    instruction = (
+        "[继续输出] 下面是你这条回复已经写好的开头，请从断点处无缝继续，"
+        "不要重复开头内容，也不要添加任何前言、解释或标注：\n\n" + prefill
+    )
+    if new_msgs and new_msgs[-1].role == "user" and isinstance(new_msgs[-1].content, str):
+        merged = new_msgs[-1].content + "\n\n" + instruction
+        new_msgs[-1] = OpenAIMessage(role="user", content=merged)
+    else:
+        new_msgs.append(OpenAIMessage(role="user", content=instruction))
+    return new_msgs, prefill
+
+
 def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
     print("🔄 [消息转换] 正在将 OpenAI 格式消息转换为 Gemini contents。")
     raw_gemini_messages = []
@@ -111,90 +225,82 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
 
         if role == "tool":
             tool_call_id_str = message.tool_call_id or ""
-            
-            if "__thought__" not in tool_call_id_str:
-                mock_text = f"[System Observation - Tool '{message.name}' Result]:\n{message.content}"
+
+            if not message.name:
+                # 没有函数名无法构造规范的 function_response，降级为文本观测
+                mock_text = f"[System Observation - Tool Result]:\n{message.content}"
                 parts.append(types.Part.from_text(text=mock_text))
                 current_gemini_role = "user"
             else:
-                if message.name and message.content is not None:
-                    tool_output_data = {}
-                    try:
-                        if isinstance(message.content, str) and \
-                           (message.content.strip().startswith("{") and message.content.strip().endswith("}")) or \
-                           (message.content.strip().startswith("[") and message.content.strip().endswith("]")):
-                            tool_output_data = json.loads(message.content)
-                        else: 
-                            tool_output_data = {"result": message.content}
-                    except json.JSONDecodeError:
-                        tool_output_data = {"result": str(message.content)}
+                # 无论是否带 __thought__ 后缀，都构造规范的 function_response，
+                # 让标准 OpenAI 客户端的工具往返也能正确工作（修复退化为纯文本的问题）。
+                tool_output_data = _coerce_tool_response(message.content)
 
+                real_tool_id = tool_call_id_str
+                thought_sig_bytes = None
+                if "__thought__" in tool_call_id_str:
                     parts_id = tool_call_id_str.split("__thought__")
                     real_tool_id = parts_id[0]
-                    b64_sig = parts_id[1]
-                    thought_sig_bytes = None
-                    try: 
-                        thought_sig_bytes = base64.b64decode(b64_sig)
-                    except: 
-                        pass
-
-                    func_resp_kwargs = {"name": message.name, "response": tool_output_data}
-                    if real_tool_id:
-                        func_resp_kwargs["id"] = real_tool_id
-                        
                     try:
-                        part_kwargs = {"function_response": types.FunctionResponse(**func_resp_kwargs)}
-                        if thought_sig_bytes:
-                            part_kwargs["thought_signature"] = thought_sig_bytes
-                        resp_part = types.Part(**part_kwargs)
-                    except Exception as e:
-                        print(f"⚠️ [工具调用] 注入 FunctionResponse 思考签名失败，将继续处理：{e}")
-                        resp_part = types.Part.from_function_response(name=message.name, response=tool_output_data)
+                        thought_sig_bytes = base64.b64decode(parts_id[1])
+                    except Exception:
+                        thought_sig_bytes = None
 
-                    parts.append(resp_part)
-                    current_gemini_role = "function"
-                
+                func_resp_kwargs = {"name": message.name, "response": tool_output_data}
+                if real_tool_id:
+                    func_resp_kwargs["id"] = real_tool_id
+
+                try:
+                    part_kwargs = {"function_response": types.FunctionResponse(**func_resp_kwargs)}
+                    if thought_sig_bytes:
+                        part_kwargs["thought_signature"] = thought_sig_bytes
+                    resp_part = types.Part(**part_kwargs)
+                except Exception as e:
+                    print(f"⚠️ [工具调用] 构造 FunctionResponse 失败，将回退为基础形式：{e}")
+                    resp_part = types.Part.from_function_response(name=message.name, response=tool_output_data)
+
+                parts.append(resp_part)
+                current_gemini_role = "function"
+
         elif role == "assistant" and message.tool_calls:
             current_gemini_role = "model"
             for tool_call in message.tool_calls:
                 function_call_data = tool_call.get("function", {})
                 function_name = function_call_data.get("name", "unknown")
                 arguments_str = function_call_data.get("arguments", "{}")
-                tool_call_id_str = tool_call.get("id", "")
-                
-                if "__thought__" not in tool_call_id_str:
-                    mock_text = f"[Model Action Log]: Decided to call function '{function_name}' with arguments: {arguments_str}"
-                    parts.append(types.Part.from_text(text=mock_text))
-                else:
-                    try: 
-                        parsed_arguments = json.loads(arguments_str)
-                    except json.JSONDecodeError: 
-                        parsed_arguments = {} 
-                        
+                tool_call_id_str = tool_call.get("id", "") or ""
+
+                try:
+                    parsed_arguments = json.loads(arguments_str) if isinstance(arguments_str, str) else (arguments_str or {})
+                except json.JSONDecodeError:
+                    parsed_arguments = {}
+
+                # 无论是否带 __thought__ 后缀，都构造规范的 function_call
+                real_tool_id = tool_call_id_str
+                thought_sig_bytes = None
+                if "__thought__" in tool_call_id_str:
                     parts_id = tool_call_id_str.split("__thought__")
                     real_tool_id = parts_id[0]
-                    b64_sig = parts_id[1]
-                    thought_sig_bytes = None
-                    try: 
-                        thought_sig_bytes = base64.b64decode(b64_sig)
-                    except: 
-                        pass
-
-                    fc_kwargs = {"name": function_name, "args": parsed_arguments}
-                    if real_tool_id:
-                        fc_kwargs["id"] = real_tool_id
-                        
                     try:
-                        part_kwargs = {"function_call": types.FunctionCall(**fc_kwargs)}
-                        if thought_sig_bytes:
-                            part_kwargs["thought_signature"] = thought_sig_bytes
-                        fc_part = types.Part(**part_kwargs)
-                    except Exception as e:
-                        print(f"⚠️ [工具调用] 注入 FunctionCall 思考签名失败，将继续处理：{e}")
-                        fc_part = types.Part.from_function_call(name=function_name, args=parsed_arguments)
-                        
-                    parts.append(fc_part)
-                    
+                        thought_sig_bytes = base64.b64decode(parts_id[1])
+                    except Exception:
+                        thought_sig_bytes = None
+
+                fc_kwargs = {"name": function_name, "args": parsed_arguments}
+                if real_tool_id:
+                    fc_kwargs["id"] = real_tool_id
+
+                try:
+                    part_kwargs = {"function_call": types.FunctionCall(**fc_kwargs)}
+                    if thought_sig_bytes:
+                        part_kwargs["thought_signature"] = thought_sig_bytes
+                    fc_part = types.Part(**part_kwargs)
+                except Exception as e:
+                    print(f"⚠️ [工具调用] 构造 FunctionCall 失败，将回退为基础形式：{e}")
+                    fc_part = types.Part.from_function_call(name=function_name, args=parsed_arguments)
+
+                parts.append(fc_part)
+
             if message.content:
                 if isinstance(message.content, str):
                     image_parts, clean_text = _extract_markdown_images_to_parts(message.content)
@@ -457,7 +563,7 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
             
             if not function_call_detected:
                 reasoning_str, normal_content_str = parse_gemini_response_for_reasoning_and_content(candidate)
-                if app_config.SAFETY_SCORE and hasattr(candidate, "safety_ratings") and candidate.safety_ratings:
+                if app_state.get_setting("safety_score", app_config.SAFETY_SCORE) and hasattr(candidate, "safety_ratings") and candidate.safety_ratings:
                     safety_html = _create_safety_ratings_html(candidate.safety_ratings)
                     if reasoning_str: reasoning_str += safety_html
                     else: normal_content_str += safety_html
