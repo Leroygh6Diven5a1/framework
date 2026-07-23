@@ -1,10 +1,8 @@
-import time
-import httpx
 import asyncio
 import secrets
-from fastapi import FastAPI, Depends, Request, HTTPException, Response
+import hashlib
+from fastapi import FastAPI, Depends, Request, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
@@ -16,74 +14,39 @@ from routes import models_api, chat_api
 from logger import rt_logger, stats
 import config
 from runtime_state import app_state
+import model_capabilities as mc
+from model_loader import get_express_models
 
 from cookie_auth import validate_cookie
 
 express_key_manager = ExpressKeyManager()
-_global_browser = None
 
-async def run_headless_browser():
-    """后台运行无头浏览器（仅本地环境可选，云端请用 Cookie 直连模式）"""
-    global _global_browser
-    try:
-        from headless.browser import HeadlessBrowser
-        from headless.harvester import CredentialHarvester
-    except ImportError:
-        print("⚠️ Playwright 未安装，无头浏览器不可用。请使用 Cookie 直连模式。")
-        return
-
-    browser = HeadlessBrowser()
-    _global_browser = browser
-    
-    harvester = CredentialHarvester(on_credentials=lambda creds: app_state.update_auth_bundle(creds))
-    
-    if not await browser.start(headless=config.HEADLESS_MODE):
-        print("❌ 无头浏览器启动失败。请改用 Cookie 直连模式（在大盘中粘贴 Cookie + Project ID）。")
-        _global_browser = None
-        return
-        
-    await browser.setup_request_interception(harvester.handle_request)
-    
-    if await browser.navigate_to_vertex():
-        await browser.send_test_message()
-        
-        while browser.is_running:
-            await asyncio.sleep(config.CREDENTIAL_REFRESH_INTERVAL)
-            if browser.is_running:
-                try:
-                    await browser.send_test_message()
-                except Exception as e:
-                    print(f"⚠️ 定时刷新异常: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from model_loader import refresh_models_config_cache
-    print("🚀 [服务启动] Vertex2OpenAI 已启动多模式多进程守护层。")
+    print("🚀 [服务启动] agentplatform2api 适配器已启动（Express API Key / Cookie 直连 双通道）。")
     if express_key_manager.get_total_keys() > 0:
         print(f"✅ [密钥配置] 已加载 {express_key_manager.get_total_keys()} 个 Express API Key。")
     else:
-        print("⚠️ [密钥配置] 未检测到 VERTEX_EXPRESS_API_KEY。若不启用网页反代，聊天请求将会报错。")
+        print("⚠️ [密钥配置] 未检测到 VERTEX_EXPRESS_API_KEY。若不启用 Cookie 直连模式，聊天请求将会报错。")
     await refresh_models_config_cache()
-    
-    # 根据大盘配置启动无头浏览器
-    if app_state.is_web_proxy_enabled():
-        asyncio.create_task(run_headless_browser())
-        
     yield
-    if _global_browser and _global_browser.is_running:
-        await _global_browser.close()
 
-app = FastAPI(title="OpenAI to Gemini Adapter", lifespan=lifespan)
+app = FastAPI(title="agentplatform2api", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    # 本服务使用 Bearer / Basic 鉴权，不依赖浏览器 Cookie；
+    # 关闭 allow_credentials 以符合 CORS 规范（通配符 + 凭证不合法）。
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 app.state.express_key_manager = express_key_manager
+
 
 @app.middleware("http")
 async def stats_tracker_middleware(request: Request, call_next):
@@ -99,565 +62,598 @@ async def stats_tracker_middleware(request: Request, call_next):
             raise e
     return await call_next(request)
 
-security = HTTPBasic()
-def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
-    if not secrets.compare_digest(credentials.password, config.API_KEY):
-        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
-    return credentials.username
+
+# ====== 仅密码登录（Cookie 会话，免输账号）======
+AUTH_COOKIE = "ap_session"
+
+def _session_token() -> str:
+    # 存 hash 而非明文 key；httponly cookie，前端 JS 读不到
+    return hashlib.sha256(("agentplatform2api::" + (config.API_KEY or "")).encode()).hexdigest()
+
+def _is_authed(request: Request) -> bool:
+    return secrets.compare_digest(request.cookies.get(AUTH_COOKIE, ""), _session_token())
+
+async def require_auth(request: Request):
+    if not _is_authed(request):
+        raise HTTPException(status_code=401, detail="未登录")
+    return True
+
+
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 · agentplatform2api</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>body{background:#fbfbfd;font-family:'Inter',system-ui,sans-serif;color:#18181b}
+.inp{border:1px solid #e8e8ec;border-radius:10px;padding:11px 13px;width:100%;outline:none;font-size:15px}
+.inp:focus{border-color:#4f46e5;box-shadow:0 0 0 3px rgba(79,70,229,.12)}
+.btn{background:#4f46e5;color:#fff;border-radius:10px;font-weight:600;padding:11px;width:100%;transition:.15s}
+.btn:hover{background:#4338ca}</style>
+</head><body class="min-h-screen flex items-center justify-center px-4">
+  <div class="w-full max-w-sm">
+    <div class="flex items-center gap-3 mb-6 justify-center">
+      <svg width="40" height="40" viewBox="0 0 40 40" fill="none"><rect width="40" height="40" rx="11" fill="url(#lg)"/>
+      <path d="M11 16 H27" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/><path d="M23 12 L28.5 16 L23 20" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M29 24 H13" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-opacity=".92"/><path d="M17 20 L11.5 24 L17 28" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" stroke-opacity=".92"/>
+      <defs><linearGradient id="lg" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse"><stop stop-color="#6366f1"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient></defs></svg>
+      <span class="text-lg font-bold tracking-tight">agentplatform2api</span>
+    </div>
+    <div class="bg-white border border-neutral-200 rounded-2xl p-6 shadow-sm">
+      <p class="text-sm text-neutral-500 mb-4">请输入访问密码（即 API_KEY）</p>
+      <form id="f" onsubmit="return doLogin(event)">
+        <input id="pw" type="password" class="inp mb-3" placeholder="密码" autofocus autocomplete="current-password">
+        <button class="btn" type="submit">进入控制台</button>
+      </form>
+      <p id="err" class="text-xs text-rose-600 mt-3 h-4"></p>
+    </div>
+  </div>
+<script>
+async function doLogin(e){
+  e.preventDefault();
+  const pw=document.getElementById('pw').value;
+  const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+  if(r.ok){ location.href='/'; } else { document.getElementById('err').textContent='密码错误，请重试'; }
+  return false;
+}
+</script>
+</body></html>
+"""
+
 
 # ==========================================
-# 💎 现代控制大盘 - 集成 Web 模式控制
+# 控制台（浅色 Vercel 风格，单文件，免构建）
 # ==========================================
-DASHBOARD_HTML = """
-<!DOCTYPE html>
+DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Vertex2OpenAI | 管理控制台</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght=400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-        body { background-color: #F8FAFC; color: #334155; font-family: 'Inter', sans-serif; }
-        .glass-panel { background: #FFFFFF; border: 1px solid #F1F5F9; box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.03), 0 0 3px rgba(0,0,0,0.02); }
-        .log-container { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.85rem; word-break: break-all; background: #FAFAF9; border: 1px solid #E5E7EB; color: #475569;}
-        .nav-item { cursor: pointer; transition: all 0.25s ease; border-left: 3px solid transparent; color: #64748B; font-weight: 500;}
-        .nav-item.active { background: #EFF6FF; border-left-color: #3B82F6; color: #2563EB; }
-        .nav-item:hover:not(.active) { background: #F8FAFC; color: #334155; }
-        @media (max-width: 768px) {
-            .nav-item { border-left: none; border-bottom: 3px solid transparent; justify-content: center; flex: 1; }
-            .nav-item.active { border-bottom-color: #3B82F6; background: #EFF6FF; }
-        }
-        ::-webkit-scrollbar { width: 6px; height: 6px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: #CBD5E1; border-radius: 10px; }
-        ::-webkit-scrollbar-thumb:hover { background: #94A3B8; }
-        .stat-value { letter-spacing: -0.03em; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>agentplatform2api · 控制台</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root { --border:#e8e8ec; --muted:#6b7280; --fg:#18181b; --bg:#fbfbfd; --accent:#4f46e5; --accent2:#7c3aed; --accent-hover:#4338ca; }
+  * { -webkit-font-smoothing:antialiased; }
+  body { background:var(--bg); color:var(--fg); font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif; }
+  .card { background:#fff; border:1px solid var(--border); border-radius:14px; box-shadow:0 1px 2px rgba(16,24,40,.04); }
+  .lbl { font-size:12px; color:var(--muted); font-weight:500; }
+  .val { font-variant-numeric:tabular-nums; letter-spacing:-.02em; }
+  .btn { background:var(--accent); color:#fff; border-radius:9px; font-weight:600; transition:.15s; box-shadow:0 1px 2px rgba(79,70,229,.25); }
+  .btn:hover { background:var(--accent-hover); }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  .btn-ghost { background:#fff; color:var(--fg); border:1px solid var(--border); border-radius:9px; font-weight:500; }
+  .btn-ghost:hover { background:#f7f7f9; }
+  .inp { border:1px solid var(--border); border-radius:9px; background:#fff; font-size:14px; padding:8px 10px; width:100%; outline:none; transition:.15s; color:var(--fg); }
+  .inp:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(79,70,229,.12); }
+  .inp:disabled { background:#f4f4f6; color:#a1a1aa; }
+  .tab { padding:14px 4px; font-size:14px; font-weight:500; color:var(--muted); border-bottom:2px solid transparent; cursor:pointer; white-space:nowrap; }
+  .tab.active { color:var(--accent); border-bottom-color:var(--accent); }
+  .tab:hover:not(.active){ color:var(--fg); }
+  .pill { display:inline-flex; align-items:center; gap:6px; font-size:12px; padding:3px 10px; border-radius:999px; border:1px solid var(--border); background:#fff; color:#52525b; }
+  .pill-accent { border-color:transparent; background:rgba(79,70,229,.08); color:var(--accent); font-weight:600; }
+  .log { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px; word-break:break-all; }
+  ::-webkit-scrollbar{width:8px;height:8px}
+  ::-webkit-scrollbar-thumb{background:#dcdce3;border-radius:8px}
+  ::-webkit-scrollbar-thumb:hover{background:#c0c0ca}
+  .toast { position:fixed; bottom:22px; left:50%; transform:translateX(-50%); background:var(--fg); color:#fff; padding:10px 18px; border-radius:10px; font-size:14px; opacity:0; transition:.25s; pointer-events:none; z-index:50; }
+  .toast.show { opacity:1; }
+  .switch { position:relative; width:40px; height:22px; }
+  .switch input{opacity:0;width:0;height:0}
+  .slider{position:absolute;inset:0;background:#e4e4e7;border-radius:999px;transition:.2s;cursor:pointer}
+  .slider:before{content:"";position:absolute;height:16px;width:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.2)}
+  input:checked + .slider{background:var(--accent)}
+  input:checked + .slider:before{transform:translateX(18px)}
+  .hero { background:linear-gradient(180deg,#fff, #fbfbfd); border:1px solid var(--border); border-radius:16px; }
+</style>
 </head>
-<body class="h-screen flex flex-col md:flex-row overflow-hidden bg-slate-50/50">
-    <aside class="w-full md:w-64 glass-panel border-b md:border-b-0 md:border-r border-slate-200 flex flex-col z-20 flex-shrink-0">
-        <div class="h-14 md:h-16 flex items-center px-4 md:px-6 border-b border-slate-100">
-            <div class="w-7 h-7 md:w-8 md:h-8 rounded-lg bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center font-bold text-white shadow-sm mr-3">V</div>
-            <span class="font-bold text-base md:text-lg tracking-tight text-slate-800">Vertex2OpenAI</span>
+<body class="min-h-screen">
+<div class="max-w-5xl mx-auto px-5 md:px-8 py-6">
+
+  <!-- Header -->
+  <header class="hero px-5 py-4 mb-6 flex items-center justify-between flex-wrap gap-3">
+    <div class="flex items-center gap-3.5">
+      <svg width="40" height="40" viewBox="0 0 40 40" fill="none" aria-hidden="true">
+        <rect width="40" height="40" rx="11" fill="url(#lg)"/>
+        <path d="M11 16 H27" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/>
+        <path d="M23 12 L28.5 16 L23 20" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M29 24 H13" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-opacity=".92"/>
+        <path d="M17 20 L11.5 24 L17 28" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" stroke-opacity=".92"/>
+        <defs><linearGradient id="lg" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse"><stop stop-color="#6366f1"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient></defs>
+      </svg>
+      <div>
+        <h1 class="text-xl font-bold tracking-tight leading-none">agentplatform<span style="color:var(--accent)">2api</span></h1>
+        <p class="text-xs text-neutral-500 mt-1.5">OpenAI 兼容代理 · Gemini Agent Platform 双通道</p>
+      </div>
+    </div>
+    <div class="flex items-center gap-2">
+      <span class="pill pill-accent" id="mode-pill">通道 —</span>
+      <span class="pill"><span class="relative flex h-2 w-2"><span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span><span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span></span><span id="uptime">运行中</span></span>
+      <button onclick="logout()" class="pill" style="cursor:pointer" title="退出登录">退出</button>
+    </div>
+  </header>
+
+  <!-- Tabs -->
+  <nav class="flex gap-6 border-b border-neutral-200 mb-6 overflow-x-auto">
+    <div class="tab active" data-tab="overview" onclick="switchTab('overview')">数据概览</div>
+    <div class="tab" data-tab="channel" onclick="switchTab('channel')">通道与凭证</div>
+    <div class="tab" data-tab="params" onclick="switchTab('params')">模型参数</div>
+    <div class="tab" data-tab="logs" onclick="switchTab('logs')">运行日志</div>
+  </nav>
+
+  <!-- Overview -->
+  <section id="view-overview">
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+      <div class="card p-4"><div class="lbl">总请求</div><div id="s-total" class="val text-2xl font-bold mt-1">0</div></div>
+      <div class="card p-4"><div class="lbl">成功响应</div><div id="s-success" class="val text-2xl font-bold mt-1 text-emerald-600">0</div></div>
+      <div class="card p-4"><div class="lbl">拥堵重试</div><div id="s-retries" class="val text-2xl font-bold mt-1 text-amber-500">0</div></div>
+      <div class="card p-4"><div class="lbl">错误 / 拦截</div><div id="s-error" class="val text-2xl font-bold mt-1 text-rose-600">0</div></div>
+    </div>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+      <div class="card p-5 flex flex-col items-center justify-center">
+        <div class="lbl w-full mb-3">服务健康度</div>
+        <div class="w-36 h-36"><canvas id="donut"></canvas></div>
+      </div>
+      <div class="card p-5 md:col-span-2">
+        <div class="lbl mb-4">Token 算力消耗</div>
+        <div class="space-y-4">
+          <div><div class="flex justify-between text-sm mb-1"><span class="text-neutral-600">Prompt（输入）</span><span id="t-prompt" class="val font-semibold">0</span></div><div class="w-full bg-neutral-100 rounded-full h-1.5"><div class="bg-black h-1.5 rounded-full" style="width:70%"></div></div></div>
+          <div><div class="flex justify-between text-sm mb-1"><span class="text-neutral-600">Completion（输出）</span><span id="t-comp" class="val font-semibold">0</span></div><div class="w-full bg-neutral-100 rounded-full h-1.5"><div class="bg-neutral-400 h-1.5 rounded-full" style="width:45%"></div></div></div>
+          <div class="pt-4 border-t border-neutral-100 flex justify-between items-center"><span class="lbl">总计</span><span id="t-total" class="val text-xl font-bold">0</span></div>
         </div>
-        <nav class="flex flex-row md:flex-col py-0 md:py-4 overflow-x-auto h-full">
-            <div onclick="switchTab('dashboard')" id="nav-dashboard" class="nav-item active px-4 py-3 md:px-6 md:py-3.5 flex items-center gap-2.5 whitespace-nowrap text-sm md:text-base">
-                <svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"></path></svg>
-                数据大盘
-            </div>
-            <div onclick="switchTab('logs')" id="nav-logs" class="nav-item px-4 py-3 md:px-6 md:py-3.5 flex items-center gap-2.5 whitespace-nowrap text-sm md:text-base">
-                <svg class="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
-                运行日志
-            </div>
-        </nav>
-        <div class="mt-auto px-6 py-5 hidden md:block border-t border-slate-100">
-            <div class="bg-slate-50/80 rounded-xl p-4 border border-slate-200/60 shadow-sm">
-                <div class="text-[11px] text-slate-400 mb-1.5 font-semibold uppercase tracking-wider">系统状态</div>
-                <div class="flex items-center gap-2 mb-2">
-                    <span class="relative flex h-2.5 w-2.5">
-                      <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                      <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
-                    </span>
-                    <span class="text-sm text-emerald-600 font-semibold">Running</span>
-                </div>
-                <div class="text-xs text-slate-500" id="sys-uptime">已运行: 0.0 h</div>
-            </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Channel -->
+  <section id="view-channel" class="hidden">
+    <div class="card p-5 mb-4">
+      <div class="lbl mb-3">上游调用通道</div>
+      <div class="flex flex-col sm:flex-row gap-3">
+        <label class="flex-1 border border-neutral-200 rounded-lg p-3 cursor-pointer flex items-start gap-3 hover:bg-neutral-50" id="opt-api">
+          <input type="radio" name="mode" value="api_key" class="mt-1" onchange="updateMode('api_key')">
+          <div><div class="font-medium text-sm">Express API Key（标准）</div><div class="text-xs text-neutral-500 mt-0.5">用 VERTEX_EXPRESS_API_KEY 调官方 SDK</div></div>
+        </label>
+        <label class="flex-1 border border-neutral-200 rounded-lg p-3 cursor-pointer flex items-start gap-3 hover:bg-neutral-50" id="opt-web">
+          <input type="radio" name="mode" value="web_proxy" class="mt-1" onchange="updateMode('web_proxy')">
+          <div><div class="font-medium text-sm">Cookie 直连反代</div><div class="text-xs text-neutral-500 mt-0.5">用控制台 Cookie 调 batchGraphql</div></div>
+        </label>
+      </div>
+    </div>
+    <div id="cookie-box" class="card p-5 hidden">
+      <div class="lbl mb-2">Google Cookie（含 HttpOnly 字段）</div>
+      <textarea id="cookie-input" rows="3" class="inp log mb-3" placeholder="粘贴 console.cloud.google.com 的完整 Cookie（支持 Cookie-Editor 导出的 JSON / Header String，自动解析）"></textarea>
+      <div class="lbl mb-2">Google Cloud Project ID</div>
+      <input id="project-input" class="inp mb-3" placeholder="可直接粘贴含 ?project=xxx 的整条 URL，自动提取">
+      <div class="flex items-center justify-between">
+        <span class="text-xs text-neutral-500">保存后自动校验是否包含 SAPISID</span>
+        <button class="btn px-4 py-2 text-sm" onclick="saveCookie()">保存并激活</button>
+      </div>
+      <p class="text-xs text-neutral-500 mt-3 leading-relaxed">💡 Cookie 通常较为持久（可维持数周甚至更久，取决于账号会话是否有效）；仅当出现 Permission Denied 等权限错误时再重新获取粘贴即可，并非只有 1–2 小时。</p>
+    </div>
+  </section>
+
+  <!-- Params -->
+  <section id="view-params" class="hidden">
+    <div class="card p-5 mb-4">
+      <div class="flex items-center justify-between flex-wrap gap-3">
+        <div>
+          <div class="lbl mb-1">按模型查看支持情况</div>
+          <select id="model-sel" class="inp" style="min-width:240px" onchange="renderCaps()"></select>
         </div>
-    </aside>
+        <div id="caps-summary" class="text-xs text-neutral-600 flex flex-wrap gap-2 max-w-xl"></div>
+      </div>
+      <p class="text-xs text-neutral-500 mt-3">下方为<b>全局默认值</b>，按模型家族自动生效；单次请求参数（或模型名后缀）可覆盖。选择模型仅用于查看其支持的参数并给出提示。</p>
+    </div>
 
-    <main class="flex-1 flex flex-col relative z-10 overflow-hidden">
-        <header class="h-14 md:h-16 glass-panel border-b border-slate-200 flex items-center justify-between px-4 md:px-8 shrink-0">
-            <h1 id="page-title" class="text-base md:text-lg font-bold text-slate-800 tracking-tight">数据大盘</h1>
-        </header>
-
-        <div class="flex-1 overflow-y-auto p-4 md:p-8 relative">
-            <div id="view-dashboard" class="max-w-6xl mx-auto space-y-4 md:space-y-6">
-                <!-- 顶部指标网格 -->
-                <div class="grid grid-cols-2 md:grid-cols-4 gap-4 md:gap-5">
-                    <div class="glass-panel p-4 md:p-5 rounded-2xl relative overflow-hidden group">
-                        <div class="absolute -right-4 -top-4 w-20 h-20 bg-blue-50 rounded-full blur-2xl"></div>
-                        <h3 class="text-slate-500 text-xs font-semibold mb-2 uppercase tracking-widest">总请求</h3>
-                        <p id="stat-total" class="stat-value text-2xl md:text-3xl font-bold text-slate-800">0</p>
-                    </div>
-                    <div class="glass-panel p-4 md:p-5 rounded-2xl relative overflow-hidden group">
-                        <div class="absolute -right-4 -top-4 w-20 h-20 bg-emerald-50 rounded-full blur-2xl"></div>
-                        <h3 class="text-slate-500 text-xs font-semibold mb-2 uppercase tracking-widest">成功响应</h3>
-                        <p id="stat-success" class="stat-value text-2xl md:text-3xl font-bold text-emerald-600">0</p>
-                    </div>
-                    <div class="glass-panel p-4 md:p-5 rounded-2xl relative overflow-hidden group">
-                        <div class="absolute -right-4 -top-4 w-20 h-20 bg-amber-50 rounded-full blur-2xl"></div>
-                        <h3 class="text-slate-500 text-xs font-semibold mb-2 uppercase tracking-widest">API 拥堵重试</h3>
-                        <p id="stat-retries" class="stat-value text-2xl md:text-3xl font-bold text-amber-500">0</p>
-                    </div>
-                    <div class="glass-panel p-4 md:p-5 rounded-2xl relative overflow-hidden group">
-                        <div class="absolute -right-4 -top-4 w-20 h-20 bg-rose-50 rounded-full blur-2xl"></div>
-                        <h3 class="text-slate-500 text-xs font-semibold mb-2 uppercase tracking-widest">错误 / 拦截</h3>
-                        <p id="stat-error" class="stat-value text-2xl md:text-3xl font-bold text-rose-600">0</p>
-                    </div>
-                </div>
-
-                <!-- 模式切换控制面板卡片 -->
-                <div class="glass-panel p-5 md:p-6 rounded-2xl">
-                    <h3 class="text-slate-800 text-sm font-bold mb-4 flex items-center gap-2">
-                        <svg class="w-4 h-4 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path></svg>
-                        上游调用通道切换
-                    </h3>
-                    <div class="flex flex-col md:flex-row gap-6 items-start md:items-center">
-                        <div class="flex items-center gap-5">
-                            <label class="flex items-center gap-2 cursor-pointer font-medium text-sm text-slate-700">
-                                <input type="radio" name="api_mode" value="api_key" checked onchange="updateMode('api_key')" class="w-4 h-4 text-blue-600 border-slate-300">
-                                <span>Express API Key (标准模式)</span>
-                            </label>
-                            <label class="flex items-center gap-2 cursor-pointer font-medium text-sm text-slate-700">
-                                <input type="radio" name="api_mode" value="web_proxy" onchange="updateMode('web_proxy')" class="w-4 h-4 text-blue-600 border-slate-300">
-                                <span>Agent Platform Studio (Cookie直连)</span>
-                            </label>
-                        </div>
-                    </div>
-                    
-                    <div id="web-proxy-config" class="hidden mt-5 pt-5 border-t border-slate-100 space-y-4">
-                        <div class="flex flex-col gap-3">
-                            <div id="cookie-direct-config" class="p-3 bg-blue-50/50 rounded-xl border border-blue-200 mt-2 space-y-3">
-                                <div>
-                                    <label class="text-xs font-bold text-slate-700 mb-1 flex items-center gap-1">
-                                        🚀 API 直连 Cookie (包含 HttpOnly 字段)
-                                    </label>
-                                    <textarea id="google-cookie-input" class="w-full text-xs p-2.5 border border-slate-300 rounded-lg shadow-inner bg-white focus:outline-none focus:ring-1 focus:ring-blue-500 text-slate-600 font-mono" rows="3" placeholder="在此粘贴从 console.cloud.google.com 获取的完整 Cookie（支持直接粘贴 Cookie-Editor 导出的 Header String 或 JSON，系统会自动解析）"></textarea>
-                                </div>
-                                <div>
-                                    <label class="text-xs font-bold text-slate-700 mb-1 block">
-                                        Google Cloud Project ID (项目 ID)
-                                    </label>
-                                    <input type="text" id="google-project-id-input" class="w-full text-xs p-2.5 border border-slate-300 rounded-lg shadow-inner bg-white focus:outline-none focus:ring-1 focus:ring-blue-500 text-slate-600 font-mono" placeholder="例如: xxxxxxx-xxxxxxx-xxxxx (可直接粘贴浏览器整条 URL，系统会自动提取 Project ID)">
-                                </div>
-                                <div class="flex justify-between items-center mt-2">
-                                    <div class="text-[10px] text-slate-500">保存后自动验证是否包含 SAPISID</div>
-                                    <button onclick="saveGoogleCookie()" class="bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs px-4 py-1.5 rounded-lg transition-all shadow-sm">保存直连配置并激活</button>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <div class="text-[11px] text-slate-600 mt-3 p-4 bg-blue-50/70 rounded-xl border border-blue-100/70 leading-relaxed shadow-sm space-y-2.5">
-                            <div>
-                                💡 <span class="font-bold text-blue-700 text-xs">获取 Cookie 与 Project ID 详细指引（支持手机端与电脑端）：</span>
-                            </div>
-                            <div class="space-y-1">
-                                <p><b>1. 获取完整 Cookie（包含关键 HttpOnly 字段）：</b></p>
-                                <ul class="list-disc pl-5 space-y-1">
-                                    <li><b>电脑端获取：</b>打开并登录 <code>console.cloud.google.com</code>，按 <b>F12</b> → 切换到 <b>Network</b> 选项卡 → 刷新网页 → 在左侧随便找一个请求点击 → 复制 Request Headers 中的 <code>Cookie</code> 整段字段值粘贴到下方。</li>
-                                    <li><b>手机端获取：</b>iOS 手机在 Safari 浏览器安装免费插件 <code>Cookie-Editor</code>，安卓手机使用 Kiwi 浏览器安装 <code>Cookie-Editor</code> 插件。登录 <code>console.cloud.google.com</code> 后点击插件，选择 <b>Export</b> 并选择 <b>Header String</b> 或 <b>JSON</b> 导出，直接粘贴到此处即可。</li>
-                                </ul>
-                            </div>
-                            <div class="space-y-1">
-                                <p><b>2. 获取 Project ID：</b></p>
-                                <ul class="list-disc pl-5">
-                                    <li>直接复制手机或电脑浏览器地址栏的<b>整条网址 URL</b>（如含有 <code>?project=xxx</code> 的链接），将其粘贴到 Project ID 的输入框中，系统会自动为你识别并提取出干净的项目 ID！</li>
-                                </ul>
-                            </div>
-                            <div class="text-amber-600 font-semibold pt-1 border-t border-blue-100/50">
-                                ⚠️ 注意事项：Cookie 有效期一般为 1~2 小时（PSIDTS 会过期），过期后模型调用会报 Permission Denied 错误，此时只需重新获取并粘贴保存即可。
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 md:gap-5">
-                    <div class="glass-panel p-5 md:p-6 rounded-2xl lg:col-span-1 flex flex-col items-center justify-center">
-                        <h3 class="text-slate-800 text-sm font-bold w-full text-left mb-6">服务健康度</h3>
-                        <div class="w-40 h-40 md:w-48 md:h-48 relative">
-                            <canvas id="successChart"></canvas>
-                        </div>
-                    </div>
-                    <div class="glass-panel p-5 md:p-6 rounded-2xl lg:col-span-2 flex flex-col justify-center">
-                        <h3 class="text-slate-800 text-sm font-bold mb-6">Token 算力消耗量</h3>
-                        <div class="space-y-6">
-                            <div>
-                                <div class="flex justify-between text-xs md:text-sm mb-2.5">
-                                    <span class="text-slate-600 font-medium flex items-center gap-2"><span class="w-2.5 h-2.5 rounded-full bg-blue-500"></span> Prompt (输入)</span>
-                                    <span id="stat-prompt" class="font-mono text-blue-600 font-bold">0</span>
-                                </div>
-                                <div class="w-full bg-slate-100 rounded-full h-2 overflow-hidden"><div class="bg-blue-500 h-full rounded-full" style="width: 80%"></div></div>
-                            </div>
-                            <div>
-                                <div class="flex justify-between text-xs md:text-sm mb-2.5">
-                                    <span class="text-slate-600 font-medium flex items-center gap-2"><span class="w-2.5 h-2.5 rounded-full bg-indigo-500"></span> Completion (输出)</span>
-                                    <span id="stat-comp" class="font-mono text-indigo-600 font-bold">0</span>
-                                </div>
-                                <div class="w-full bg-slate-100 rounded-full h-2 overflow-hidden"><div class="bg-indigo-500 h-full rounded-full" style="width: 60%"></div></div>
-                            </div>
-                            <div class="pt-5 border-t border-slate-100 mt-5 flex justify-between items-center">
-                                <span class="text-xs md:text-sm text-slate-500 font-bold uppercase tracking-wider">总计消耗 (Total)</span>
-                                <span id="stat-total-tokens" class="text-xl md:text-2xl font-bold text-slate-800 font-mono tracking-tight">0</span>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <div id="view-logs" class="hidden h-full max-w-6xl mx-auto flex flex-col glass-panel rounded-2xl overflow-hidden">
-                <div class="bg-white px-4 py-3 border-b border-slate-200 flex items-center gap-2.5">
-                    <div class="flex gap-1.5">
-                        <div class="w-3 h-3 rounded-full bg-rose-400"></div>
-                        <div class="w-3 h-3 rounded-full bg-amber-400"></div>
-                        <div class="w-3 h-3 rounded-full bg-emerald-400"></div>
-                    </div>
-                    <span class="ml-3 text-[11px] md:text-xs text-slate-400 font-mono font-medium">terminal ~ 实时监控</span>
-                </div>
-                <div id="log-window" class="log-container p-4 md:p-5 flex-1 overflow-y-auto space-y-2 text-[13px]"></div>
-            </div>
+    <div class="grid md:grid-cols-2 gap-4">
+      <!-- 思考 -->
+      <div class="card p-5">
+        <div class="text-sm font-semibold mb-3">思考强度</div>
+        <div class="mb-3" id="wrap-g3level">
+          <div class="lbl mb-1">Gemini 3.x 思考档位（thinking_level）</div>
+          <select id="thinking_g3_level" class="inp"><option value="">自动（按模型默认）</option><option value="minimal">minimal</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select>
         </div>
-    </main>
+        <div id="wrap-g25budget">
+          <div class="lbl mb-1">Gemini 2.5 思考预算（thinking_budget，-1=动态，0=关闭*）</div>
+          <input id="thinking_g25_budget" type="number" class="inp" placeholder="-1">
+        </div>
+        <p id="think-note" class="text-xs text-neutral-500 mt-2"></p>
+      </div>
 
-    <script>
-        let chartInstance = null;
+      <!-- 生图 -->
+      <div class="card p-5">
+        <div class="text-sm font-semibold mb-3">生图</div>
+        <div class="mb-3">
+          <div class="lbl mb-1">默认分辨率（image_size）</div>
+          <select id="image_size" class="inp"><option value="512">512</option><option value="1K">1K</option><option value="2K">2K</option><option value="4K">4K</option></select>
+        </div>
+        <div>
+          <div class="lbl mb-1">默认宽高比（aspect_ratio）</div>
+          <select id="image_aspect_ratio" class="inp"></select>
+        </div>
+        <p id="image-note" class="text-xs text-neutral-500 mt-2"></p>
+      </div>
 
+      <!-- 采样默认 -->
+      <div class="card p-5">
+        <div class="text-sm font-semibold mb-3">采样默认值 <span class="text-xs font-normal text-neutral-400">（留空=不注入，交给模型默认）</span></div>
+        <div class="grid grid-cols-3 gap-3">
+          <div><div class="lbl mb-1">temperature</div><input id="default_temperature" type="number" step="0.1" class="inp" placeholder="—"></div>
+          <div><div class="lbl mb-1">top_p</div><input id="default_top_p" type="number" step="0.05" class="inp" placeholder="—"></div>
+          <div><div class="lbl mb-1">max_tokens</div><input id="default_max_tokens" type="number" class="inp" placeholder="—"></div>
+        </div>
+        <p id="sampling-note" class="text-xs text-neutral-500 mt-2"></p>
+      </div>
 
-        function formatNumber(num) { return num.toLocaleString('en-US'); }
+      <!-- 输入图压缩 -->
+      <div class="card p-5">
+        <div class="flex items-center justify-between mb-3">
+          <div class="text-sm font-semibold">输入图片压缩</div>
+          <label class="switch"><input type="checkbox" id="img_compress_enabled"><span class="slider"></span></label>
+        </div>
+        <div class="grid grid-cols-3 gap-3">
+          <div><div class="lbl mb-1">最长边(px)</div><input id="img_compress_max_dim" type="number" class="inp"></div>
+          <div><div class="lbl mb-1">阈值(MB)</div><input id="img_compress_max_mb" type="number" step="0.1" class="inp"></div>
+          <div><div class="lbl mb-1">JPEG质量</div><input id="img_compress_quality" type="number" class="inp"></div>
+        </div>
+      </div>
 
-        function switchTab(tabId) {
-            document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
-            document.getElementById('nav-' + tabId).classList.add('active');
-            
-            document.getElementById('view-dashboard').classList.add('hidden');
-            document.getElementById('view-logs').classList.add('hidden');
-            document.getElementById('view-' + tabId).classList.remove('hidden');
-            
-            document.getElementById('page-title').innerText = tabId === 'dashboard' ? '数据大盘' : '运行日志';
-        }
+      <!-- 重试 -->
+      <div class="card p-5">
+        <div class="text-sm font-semibold mb-3">重试与退避</div>
+        <div class="grid grid-cols-2 gap-3">
+          <div><div class="lbl mb-1">最大重试次数</div><input id="retry_max" type="number" class="inp"></div>
+          <div><div class="lbl mb-1">退避间隔(秒)</div><input id="retry_backoff_seconds" type="number" step="0.5" class="inp"></div>
+        </div>
+      </div>
 
-        function renderChart(success, error, retries) {
-            const ctx = document.getElementById('successChart').getContext('2d');
-            let dataArr = [success, error, retries];
-            let colorArr = ['#10B981', '#E11D48', '#F59E0B'];
-            if (success === 0 && error === 0 && retries === 0) {
-                dataArr = [1]; colorArr = ['#E2E8F0'];
-            }
-            
-            if (chartInstance) {
-                chartInstance.data.datasets[0].data = dataArr;
-                chartInstance.data.datasets[0].backgroundColor = colorArr;
-                chartInstance.update();
-                return;
-            }
-            chartInstance = new Chart(ctx, {
-                type: 'doughnut',
-                data: {
-                    labels: ['成功', '错误', '拥堵重试'],
-                    datasets: [{
-                        data: dataArr,
-                        backgroundColor: colorArr,
-                        borderWidth: 2, borderColor: '#FFFFFF', hoverOffset: 4
-                    }]
-                },
-                options: { maintainAspectRatio: false, cutout: '75%', plugins: { legend: { display: false } }, animation: { animateScale: true } }
-            });
-        }
+      <!-- 开关 -->
+      <div class="card p-5">
+        <div class="text-sm font-semibold mb-3">开关 & 预填充</div>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between"><span class="text-sm">假流式（fake streaming）</span><label class="switch"><input type="checkbox" id="fake_streaming"><span class="slider"></span></label></div>
+          <div class="flex items-center justify-between"><span class="text-sm">假流式心跳间隔(秒)</span><input id="fake_streaming_interval" type="number" step="0.5" class="inp" style="width:90px"></div>
+          <div class="flex items-center justify-between"><span class="text-sm">多 Key 轮询（round-robin）</span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
+          <div class="flex items-center justify-between"><span class="text-sm">输出附加安全分</span><label class="switch"><input type="checkbox" id="safety_score"><span class="slider"></span></label></div>
+          <div class="flex items-center justify-between gap-3"><span class="text-sm">预填充兼容模式</span>
+            <select id="prefill_mode" class="inp" style="width:130px"><option value="smart">智能</option><option value="minimal">最小</option><option value="off">关闭</option></select>
+          </div>
+        </div>
+      </div>
+    </div>
 
-        async function fetchStats() {
-            try {
-                const res = await fetch('/api/stats');
-                const data = await res.json();
-                
-                document.getElementById('stat-total').innerText = formatNumber(data.total);
-                document.getElementById('stat-success').innerText = formatNumber(data.success);
-                document.getElementById('stat-error').innerText = formatNumber(data.error);
-                document.getElementById('stat-retries').innerText = formatNumber(data.retries);
-                
-                let hours = (data.uptime / 3600).toFixed(1);
-                document.getElementById('sys-uptime').innerText = '已运行: ' + hours + ' h';
-                
-                document.getElementById('stat-prompt').innerText = formatNumber(data.prompt_tokens);
-                document.getElementById('stat-comp').innerText = formatNumber(data.completion_tokens);
-                document.getElementById('stat-total-tokens').innerText = formatNumber(data.prompt_tokens + data.completion_tokens);
-                
-                renderChart(data.success, data.error, data.retries);
-            } catch (e) {
-                console.error("Fetch stats failed", e);
-            }
-        }
+    <div class="flex justify-end mt-4">
+      <button class="btn px-5 py-2.5 text-sm" onclick="saveSettings()">保存设置</button>
+    </div>
+  </section>
 
-        async function updateMode(mode) {
-            if(mode === 'web_proxy') document.getElementById('web-proxy-config').classList.remove('hidden');
-            else document.getElementById('web-proxy-config').classList.add('hidden');
-            
-            await fetch('/api/settings/mode', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ mode: mode })
-            });
-            if(mode === 'web_proxy') fetchStats(); // Refresh immediately
-        }
+  <!-- Logs -->
+  <section id="view-logs" class="hidden">
+    <div class="card overflow-hidden">
+      <div class="px-4 py-2.5 border-b border-neutral-200 flex items-center gap-2">
+        <div class="flex gap-1.5"><div class="w-3 h-3 rounded-full bg-rose-400"></div><div class="w-3 h-3 rounded-full bg-amber-400"></div><div class="w-3 h-3 rounded-full bg-emerald-400"></div></div>
+        <span class="ml-2 text-xs text-neutral-400 log">terminal · 实时监控</span>
+      </div>
+      <div id="logwin" class="log p-4 space-y-1.5 overflow-y-auto bg-[#fbfbfb]" style="height:60vh"></div>
+    </div>
+  </section>
+</div>
+<div id="toast" class="toast"></div>
 
-        function tryParseCookies(str) {
-            str = str.trim();
-            if (str.startsWith('[') && str.endsWith(']')) {
-                try {
-                    const arr = JSON.parse(str);
-                    if (Array.isArray(arr)) {
-                        return arr.map(c => {
-                            const name = c.name || c.key;
-                            const value = c.value;
-                            return (name && value) ? `${name}=${value}` : '';
-                        }).filter(Boolean).join('; ');
-                    }
-                } catch (e) {}
-            }
-            return str;
-        }
+<script>
+const $ = id => document.getElementById(id);
+let CAPS = {}, chart = null, curAR = "";
+const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 
-        function handleCookieInput(e) {
-            let val = e.target.value.trim();
-            if (val.includes('===VERTEX_SYNC===')) {
-                const lines = val.split('\\n');
-                let parsedProject = '';
-                let parsedCookie = '';
-                for (let line of lines) {
-                    const l = line.trim();
-                    if (l.startsWith('PROJECT_ID:')) {
-                        parsedProject = l.substring('PROJECT_ID:'.length).trim();
-                    } else if (l.startsWith('COOKIE:')) {
-                        parsedCookie = l.substring('COOKIE:'.length).trim();
-                    }
-                }
-                if (parsedProject && parsedCookie) {
-                    parsedCookie = tryParseCookies(parsedCookie);
-                    document.getElementById('google-cookie-input').value = parsedCookie;
-                    document.getElementById('google-project-id-input').value = parsedProject;
-                    alert('🎉 成功识别并解析一键同步凭证！\\nProject ID: ' + parsedProject);
-                }
-            } else {
-                const parsed = tryParseCookies(val);
-                if (parsed !== val) {
-                    document.getElementById('google-cookie-input').value = parsed;
-                }
-            }
-        }
+function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1800); }
+function fmt(n){ return (n||0).toLocaleString('en-US'); }
+async function logout(){ try{ await fetch('/api/logout',{method:'POST'}); }catch(e){} location.href='/'; }
 
-        async function saveGoogleCookie() {
-            let cookieStr = document.getElementById('google-cookie-input').value.trim();
-            let projectId = document.getElementById('google-project-id-input').value.trim();
-            
-            if (cookieStr.includes('===VERTEX_SYNC===')) {
-                const lines = cookieStr.split('\\n');
-                let parsedProject = '';
-                let parsedCookie = '';
-                for (let line of lines) {
-                    const l = line.trim();
-                    if (l.startsWith('PROJECT_ID:')) {
-                        parsedProject = l.substring('PROJECT_ID:'.length).trim();
-                    } else if (l.startsWith('COOKIE:')) {
-                        parsedCookie = l.substring('COOKIE:'.length).trim();
-                    }
-                }
-                if (parsedProject && parsedCookie) {
-                    cookieStr = parsedCookie;
-                    projectId = parsedProject;
-                }
-            }
+function switchTab(t){
+  document.querySelectorAll('.tab').forEach(e=>e.classList.toggle('active', e.dataset.tab===t));
+  ['overview','channel','params','logs'].forEach(v=>$('view-'+v).classList.toggle('hidden', v!==t));
+}
 
-            cookieStr = tryParseCookies(cookieStr);
-            document.getElementById('google-cookie-input').value = cookieStr;
-            document.getElementById('google-project-id-input').value = projectId;
+/* ---------- Overview ---------- */
+function renderChart(s,e,r){
+  const ctx=$('donut').getContext('2d');
+  let data=[s,e,r], colors=['#171717','#e11d48','#f59e0b'];
+  if(s===0&&e===0&&r===0){ data=[1]; colors=['#ededed']; }
+  if(chart){ chart.data.datasets[0].data=data; chart.data.datasets[0].backgroundColor=colors; chart.update(); return; }
+  chart=new Chart(ctx,{type:'doughnut',data:{labels:['成功','错误','重试'],datasets:[{data,backgroundColor:colors,borderWidth:2,borderColor:'#fff'}]},options:{cutout:'72%',plugins:{legend:{display:false}}}});
+}
+async function fetchStats(){
+  try{
+    const d=await (await fetch('/api/stats')).json();
+    $('s-total').textContent=fmt(d.total); $('s-success').textContent=fmt(d.success);
+    $('s-error').textContent=fmt(d.error); $('s-retries').textContent=fmt(d.retries);
+    $('t-prompt').textContent=fmt(d.prompt_tokens); $('t-comp').textContent=fmt(d.completion_tokens);
+    $('t-total').textContent=fmt((d.prompt_tokens||0)+(d.completion_tokens||0));
+    $('uptime').textContent='已运行 '+(d.uptime/3600).toFixed(1)+' h';
+    renderChart(d.success,d.error,d.retries);
+  }catch(e){}
+}
 
-            if(!cookieStr || !projectId) {
-                alert("请输入完整的 Cookie 字符串和 Project ID");
-                return;
-            }
-            try {
-                const res = await fetch('/api/headless/cookie', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ cookie: cookieStr, project_id: projectId })
-                });
-                const data = await res.json();
-                if(res.ok) {
-                    alert(data.message || "✅ 保存成功！直连模式已启用。");
-                    setTimeout(fetchStats, 1000);
-                } else {
-                    alert("❌ " + (data.error || "保存失败"));
-                }
-            } catch(e) {
-                alert("❌ 网络请求失败");
-            }
-        }
+/* ---------- Channel ---------- */
+async function updateMode(m){
+  $('cookie-box').classList.toggle('hidden', m!=='web_proxy');
+  $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : '通道 Express API';
+  await fetch('/api/settings/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})});
+}
+function parseCookies(str){
+  str=(str||'').trim();
+  if(str.startsWith('[')&&str.endsWith(']')){ try{ const a=JSON.parse(str); if(Array.isArray(a)) return a.map(c=>{const n=c.name||c.key,v=c.value; return (n&&v)?`${n}=${v}`:'';}).filter(Boolean).join('; ');}catch(e){} }
+  return str;
+}
+async function saveCookie(){
+  let ck=parseCookies($('cookie-input').value); let pid=$('project-input').value.trim();
+  const m=pid.match(/[?&]project=([^&]+)/)||pid.match(/\/projects\/([^\/]+)/); if(m) pid=m[1];
+  $('cookie-input').value=ck; $('project-input').value=pid;
+  if(!ck||!pid){ toast('请填写完整 Cookie 和 Project ID'); return; }
+  try{
+    const r=await fetch('/api/cookie',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie:ck,project_id:pid})});
+    const d=await r.json(); toast(r.ok?(d.message||'已保存并激活'):('❌ '+(d.error||'保存失败')));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+async function loadRuntime(){
+  try{
+    const s=await (await fetch('/api/settings/runtime')).json();
+    const m=s.use_web_proxy?'web_proxy':'api_key';
+    document.querySelector(`input[name=mode][value=${m}]`).checked=true;
+    $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : '通道 Express API';
+    $('cookie-box').classList.toggle('hidden', m!=='web_proxy');
+    if(s.google_cookie) $('cookie-input').value=s.google_cookie;
+    if(s.google_project_id) $('project-input').value=s.google_project_id;
+  }catch(e){}
+}
 
-        async function refreshCredentials() {
-            try {
-                const res = await fetch('/api/headless/refresh', { method: 'POST' });
-                if(res.ok) alert("🔄 已向无头浏览器发送刷新指令，可能需要数秒完成。");
-                else alert("❌ 刷新失败，请检查无头浏览器是否运行正常。");
-                setTimeout(fetchStats, 2000);
-            } catch(e) {
-                alert("❌ 网络请求失败");
-            }
-        }
+/* ---------- Params ---------- */
+async function loadParams(){
+  try{
+    const s=await (await fetch('/api/settings')).json();
+    curAR = s.image_aspect_ratio || "";
+    const setV=(id,v)=>{ const el=$(id); if(!el) return; if(el.type==='checkbox') el.checked=!!v; else el.value=(v===null||v===undefined)?'':v; };
+    ['thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score'].forEach(k=>setV(k,s[k]));
+  }catch(e){}
+  try{
+    const c=await (await fetch('/api/capabilities')).json();
+    CAPS=c.capabilities||{};
+    $('model-sel').innerHTML=(c.models||[]).map(m=>`<option value="${m}">${m}</option>`).join('');
+    renderCaps();
+  }catch(e){}
+}
+function chip(t, accent){ return `<span class="pill${accent?' pill-accent':''}">${t}</span>`; }
+function fillARFor(cap){
+  const sel=$('image_aspect_ratio');
+  const list = (cap && cap.is_image && cap.image_aspect_ratios.length) ? cap.image_aspect_ratios : COMMON_ARS;
+  sel.innerHTML='<option value="">自动</option>' + list.map(a=>`<option value="${a}">${a}</option>`).join('');
+  sel.value = (curAR && list.includes(curAR)) ? curAR : "";
+}
+function renderCaps(){
+  const m=$('model-sel').value; const cap=CAPS[m]; if(!cap) return;
+  const th=cap.thinking||{};
+  let sum=[chip('家族 '+cap.family, true)];
+  if(th.kind==='level') sum.push(chip('思考档位 '+(th.levels||[]).join(' / ')));
+  else if(th.kind==='budget') sum.push(chip('思考预算 '+th.budget_min+'~'+th.budget_max));
+  else sum.push(chip('无思考调节'));
+  if(cap.is_image){
+    sum.push(chip('分辨率 '+cap.image_sizes.join('/')));
+    sum.push(chip('比例 '+cap.image_aspect_ratios.length+' 种'));
+    sum.push(chip('不支持函数调用'));
+  } else {
+    sum.push(chip('采样 '+(cap.sampling_advice==='deprecated'?'已废弃·自动移除':cap.sampling_advice==='recommend_default'?'可调·建议默认':'可调')));
+    sum.push(chip('支持函数调用'));
+  }
+  if(cap.supports_search) sum.push(chip('支持搜索'));
+  $('caps-summary').innerHTML=sum.join('');
 
-        async function loadRuntimeSettings() {
-            try {
-                const res = await fetch('/api/settings/runtime');
-                const state = await res.json();
-                if (state.use_web_proxy) {
-                    document.querySelector('input[name="api_mode"][value="web_proxy"]').checked = true;
-                    document.getElementById('web-proxy-config').classList.remove('hidden');
-                } else {
-                    document.querySelector('input[name="api_mode"][value="api_key"]').checked = true;
-                }
-                if (state.google_cookie) document.getElementById('google-cookie-input').value = state.google_cookie;
-                if (state.google_project_id) document.getElementById('google-project-id-input').value = state.google_project_id;
-            } catch (e) {
-                console.error("获取运行状态失败", e);
-            }
-        }
+  const isLevel=th.kind==='level', isBudget=th.kind==='budget';
+  $('thinking_g3_level').disabled=!isLevel;
+  $('thinking_g25_budget').disabled=!isBudget;
+  $('wrap-g3level').style.opacity=isLevel?'1':'.4';
+  $('wrap-g25budget').style.opacity=isBudget?'1':'.4';
+  let tn='';
+  if(cap.is_image) tn='生图模型不接受思考参数（模型内部自行思考）。';
+  else if(isLevel) tn='该模型用思考档位' + ((th.levels && !th.levels.includes('minimal')) ? '（此模型最低 low，无 minimal，且无法关闭）' : '（无法完全关闭，最省为 minimal）') + '。';
+  else if(isBudget) tn=(cap.family==='g25' && m.includes('pro')) ? '2.5 Pro 最低预算 128，无法设 0 关闭；-1 为动态。' : '2.5 Flash 可设 0 关闭思考，-1 为动态。';
+  else tn='该模型不支持思考调节。';
+  $('think-note').textContent=tn;
 
-        const logWindow = document.getElementById('log-window');
-        let isAutoScroll = true;
-        
-        logWindow.addEventListener('scroll', () => {
-            isAutoScroll = logWindow.scrollHeight - logWindow.scrollTop - logWindow.clientHeight < 50;
-        });
+  const imgOn=cap.is_image;
+  $('image_size').disabled=!imgOn; $('image_aspect_ratio').disabled=!imgOn;
+  fillARFor(cap);
+  $('image-note').textContent = imgOn
+    ? ('该模型支持比例：' + cap.image_aspect_ratios.join('、') + '；分辨率 ' + cap.image_sizes.join('/') + '。选到不支持的比例不会报错，会自动回退为“由模型决定”。')
+    : '仅生图模型（名称含 image）使用此项。';
 
-        function formatLogText(text) {
-            let color = "#475569";
-            let bgColor = "transparent";
-            let borderLeft = "3px solid transparent";
-            
-            if(text.includes("INFO") || text.includes("✅") || text.includes("🎉")) {
-                color = "#0369A1";
-                borderLeft = "3px solid #38BDF8";
-            }
-            else if(text.includes("WARN") || text.includes("⚠️")) {
-                color = "#B45309"; 
-                bgColor = "#FFFBEB"; 
-                borderLeft = "3px solid #F59E0B";
-            }
-            else if(text.includes("ERROR") || text.includes("❌")) {
-                color = "#BE123C"; 
-                bgColor = "#FEF2F2"; 
-                borderLeft = "3px solid #F43F5E";
-            }
-            else if(text.includes("💰")) {
-                color = "#6D28D9"; 
-                bgColor = "#FAF5FF";
-                borderLeft = "3px solid #A855F7";
-            }
-            
-            let safeText = text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
-            safeText = safeText.replace(/(gemini-[a-zA-Z0-9.-]+)/g, '<span style="color: #059669; font-weight: 700;">$1</span>');
-            
-            return `<div style="color: ${color}; background-color: ${bgColor}; border-left: ${borderLeft}; padding: 6px 10px; border-radius: 4px;">${safeText}</div>`;
-        }
+  $('sampling-note').textContent = cap.is_image
+    ? '生图模型会自动剥离采样参数。'
+    : (cap.sampling_advice==='deprecated'
+        ? '⚠️ 该模型已废弃 temperature/top_p/top_k（官方要求移除，现忽略、未来 400），代理会自动移除；如需更确定的输出请改用系统指令。candidate_count 在 3.x 也不支持。'
+        : cap.sampling_advice==='recommend_default'
+          ? '官方建议 Gemini 3.x 保持采样默认值（可调，但改动可能致循环/降智）；留空即用模型默认。'
+          : '该模型支持采样参数；留空即用模型默认。');
+}
+function numOrNull(id){ const v=$(id).value.trim(); return v===''?null:Number(v); }
+function numOr(id,d){ const v=$(id).value.trim(); return v===''?d:Number(v); }
+async function saveSettings(){
+  const patch={
+    thinking_g3_level:$('thinking_g3_level').value,
+    thinking_g25_budget:numOr('thinking_g25_budget',-1),
+    image_size:$('image_size').value,
+    image_aspect_ratio:$('image_aspect_ratio').value,
+    default_temperature:numOrNull('default_temperature'),
+    default_top_p:numOrNull('default_top_p'),
+    default_max_tokens:numOrNull('default_max_tokens'),
+    img_compress_enabled:$('img_compress_enabled').checked,
+    img_compress_max_dim:numOr('img_compress_max_dim',1536),
+    img_compress_max_mb:numOr('img_compress_max_mb',1.5),
+    img_compress_quality:numOr('img_compress_quality',85),
+    retry_max:numOr('retry_max',10),
+    retry_backoff_seconds:numOr('retry_backoff_seconds',5),
+    fake_streaming:$('fake_streaming').checked,
+    fake_streaming_interval:numOr('fake_streaming_interval',1),
+    roundrobin:$('roundrobin').checked,
+    safety_score:$('safety_score').checked,
+    prefill_mode:$('prefill_mode').value,
+  };
+  try{
+    const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
+    toast(r.ok?'设置已保存':'保存失败');
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
 
-        const evtSource = new EventSource('/stream-logs');
-        evtSource.onmessage = (e) => {
-            if(e.data.includes("keep-alive heartbeat")) return;
-            logWindow.insertAdjacentHTML('beforeend', formatLogText(e.data));
-            if (isAutoScroll) logWindow.scrollTop = logWindow.scrollHeight;
-        };
+/* ---------- Logs ---------- */
+const logwin=$('logwin'); let autoscroll=true;
+logwin.addEventListener('scroll',()=>{ autoscroll = logwin.scrollHeight-logwin.scrollTop-logwin.clientHeight<50; });
+function logLine(t){
+  let c='#525252',bg='transparent',bl='2px solid transparent';
+  if(t.includes('✅')||t.includes('🎉')){c='#0369a1';bl='2px solid #38bdf8';}
+  else if(t.includes('⚠️')||t.includes('WARN')||t.includes('🔄')||t.includes('重试')){c='#b45309';bg='#fffbeb';bl='2px solid #f59e0b';}
+  else if(t.includes('❌')||t.includes('ERROR')){c='#be123c';bg='#fef2f2';bl='2px solid #f43f5e';}
+  else if(t.includes('💰')){c='#6d28d9';bg='#faf5ff';bl='2px solid #a855f7';}
+  let s=t.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/(gemini-[a-zA-Z0-9.\-]+)/g,'<span style="color:#059669;font-weight:600">$1</span>');
+  return `<div style="color:${c};background:${bg};border-left:${bl};padding:5px 9px;border-radius:4px">${s}</div>`;
+}
+try{
+  const es=new EventSource('/stream-logs');
+  es.onmessage=e=>{ if(e.data.includes('keep-alive')) return; logwin.insertAdjacentHTML('beforeend',logLine(e.data)); if(autoscroll) logwin.scrollTop=logwin.scrollHeight; };
+}catch(e){}
 
-        function handleProjectIdInput(e) {
-            let val = e.target.value.trim();
-            if (val.includes('project=')) {
-                const match = val.match(/[?&]project=([^&]+)/);
-                if (match && match[1]) {
-                    e.target.value = match[1];
-                }
-            } else if (val.includes('/projects/')) {
-                const match = val.match(/\/projects\/([^/]+)/);
-                if (match && match[1]) {
-                    e.target.value = match[1];
-                }
-            }
-        }
+/* ---------- Project ID auto-extract ---------- */
+$('project-input').addEventListener('input',e=>{ const v=e.target.value.trim(); const m=v.match(/[?&]project=([^&]+)/)||v.match(/\/projects\/([^\/]+)/); if(m) e.target.value=m[1]; });
+$('image_aspect_ratio').addEventListener('change', e=>{ curAR=e.target.value; });
 
-        function init() {
-            fetchStats();
-            loadRuntimeSettings();
-            setInterval(fetchStats, 3000);
-            document.getElementById('google-cookie-input').addEventListener('input', handleCookieInput);
-            document.getElementById('google-project-id-input').addEventListener('input', handleProjectIdInput);
-        }
-
-        init();
-    </script>
+/* init */
+fetchStats(); setInterval(fetchStats,3000); loadRuntime(); loadParams();
+</script>
 </body>
 </html>
 """
 
+
 @app.get("/", response_class=HTMLResponse)
-async def dashboard_ui(username: str = Depends(verify_auth)):
-    return DASHBOARD_HTML
+async def dashboard_ui(request: Request):
+    if _is_authed(request):
+        return HTMLResponse(DASHBOARD_HTML)
+    return HTMLResponse(LOGIN_HTML)
+
+
+class LoginBody(BaseModel):
+    password: str
+
+
+@app.post("/api/login")
+async def login(body: LoginBody):
+    if config.API_KEY and secrets.compare_digest(body.password, config.API_KEY):
+        resp = JSONResponse(content={"ok": True})
+        resp.set_cookie(AUTH_COOKIE, _session_token(), httponly=True, samesite="lax", max_age=60 * 60 * 24 * 30, path="/")
+        return resp
+    return JSONResponse(status_code=401, content={"error": "密码错误"})
+
+
+@app.post("/api/logout")
+async def logout():
+    resp = JSONResponse(content={"ok": True})
+    resp.delete_cookie(AUTH_COOKIE, path="/")
+    return resp
+
 
 @app.get("/api/stats")
-async def get_stats_api(username: str = Depends(verify_auth)):
+async def get_stats_api(_auth: bool = Depends(require_auth)):
     return JSONResponse(content=stats.get_json_stats())
 
+
 # ==========================================
-# 💎 API：设置与无头浏览器控制
+# 设置与通道控制
 # ==========================================
 class ModeSetting(BaseModel):
     mode: str
 
+
 @app.get("/api/settings/runtime")
-async def get_runtime_settings(username: str = Depends(verify_auth)):
+async def get_runtime_settings(_auth: bool = Depends(require_auth)):
     return JSONResponse(content={
         "use_web_proxy": app_state.is_web_proxy_enabled(),
         "google_cookie": app_state.get_google_cookie(),
-        "google_project_id": app_state.get_project_id()
+        "google_project_id": app_state.get_project_id(),
     })
+
 
 @app.post("/api/settings/mode")
-async def set_settings_mode(setting: ModeSetting, username: str = Depends(verify_auth)):
+async def set_settings_mode(setting: ModeSetting, _auth: bool = Depends(require_auth)):
     app_state.enable_web_proxy(setting.mode == "web_proxy")
-    
-    # 若有 cookie，无需强行启动无头浏览器，它会走直连模式
-    global _global_browser
-    if setting.mode == "web_proxy" and (not _global_browser or not _global_browser.is_running):
-        # 仅当没有 Cookie 时尝试启动备用的无头浏览器
-        if not app_state.get_google_cookie() and config.HEADLESS_MODE:
-            asyncio.create_task(run_headless_browser())
-        
     return JSONResponse(content={"status": "success"})
 
-@app.get("/api/headless/status")
-async def get_headless_status(username: str = Depends(verify_auth)):
-    global _global_browser
-    is_running = _global_browser is not None and _global_browser.is_running
-    needs_login = False
-    return JSONResponse(content={
-        "is_running": is_running,
-        "needs_login": needs_login,
-        "credential_age": app_state.get_credential_age() if app_state.get_credential_timestamp() > 0 else None
-    })
 
-@app.post("/api/headless/refresh")
-async def trigger_headless_refresh(username: str = Depends(verify_auth)):
-    global _global_browser
-    if _global_browser and _global_browser.is_running:
-        asyncio.create_task(_global_browser.send_test_message())
-        return JSONResponse(content={"status": "success"})
-    return JSONResponse(status_code=503, content={"error": "无头浏览器未运行 (如果是直连模式则无需刷新)"})
+@app.get("/api/settings")
+async def get_settings_api(_auth: bool = Depends(require_auth)):
+    return JSONResponse(content=app_state.get_settings())
+
+
+@app.post("/api/settings")
+async def update_settings_api(request: Request, _auth: bool = Depends(require_auth)):
+    try:
+        patch = await request.json()
+    except Exception:
+        patch = {}
+    if not isinstance(patch, dict):
+        return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON 对象。"})
+    updated = app_state.update_settings(patch)
+    return JSONResponse(content=updated)
+
+
+@app.get("/api/capabilities")
+async def get_capabilities_api(_auth: bool = Depends(require_auth)):
+    try:
+        models = await get_express_models()
+    except Exception:
+        models = []
+    caps = {m: mc.capabilities_summary(m) for m in models}
+    return JSONResponse(content={"models": models, "capabilities": caps})
+
 
 class CookieSetting(BaseModel):
     cookie: str
     project_id: str
 
-@app.post("/api/headless/cookie")
-async def set_google_cookie(setting: CookieSetting, username: str = Depends(verify_auth)):
+
+@app.post("/api/cookie")
+async def set_google_cookie(setting: CookieSetting, _auth: bool = Depends(require_auth)):
     validation = validate_cookie(setting.cookie)
     if not validation["valid"]:
         return JSONResponse(status_code=400, content={"error": validation["message"]})
-        
     app_state.set_google_cookie(setting.cookie.strip())
     app_state.set_project_id(setting.project_id.strip())
-    
     return JSONResponse(content={"status": "success", "message": validation["message"]})
 
 
-
 @app.get("/stream-logs")
-async def stream_logs_endpoint(request: Request, username: str = Depends(verify_auth)):
+async def stream_logs_endpoint(request: Request, _auth: bool = Depends(require_auth)):
     async def log_generator():
         q = asyncio.Queue()
         rt_logger.queues.append(q)
@@ -677,5 +673,6 @@ async def stream_logs_endpoint(request: Request, username: str = Depends(verify_
                 rt_logger.queues.remove(q)
     return StreamingResponse(log_generator(), media_type="text/event-stream")
 
-app.include_router(models_api.router) 
+
+app.include_router(models_api.router)
 app.include_router(chat_api.router)

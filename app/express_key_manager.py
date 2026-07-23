@@ -1,10 +1,11 @@
 import random
 from typing import List, Optional, Tuple
 import config as app_config
+from runtime_state import app_state
 
 
 class ExpressKeyManager:
-    """管理 Vertex AI Express Mode API Key，支持随机或轮询选择。"""
+    """管理 Agent Platform (原 Vertex AI) Express Mode API Key，支持随机或轮询选择。"""
 
     def __init__(self):
         self.express_keys: List[str] = app_config.VERTEX_EXPRESS_API_KEY_VAL
@@ -39,7 +40,7 @@ class ExpressKeyManager:
         return original_idx, key
 
     def get_express_api_key(self) -> Optional[Tuple[int, str]]:
-        if app_config.ROUNDROBIN:
+        if app_state.get_setting("roundrobin", app_config.ROUNDROBIN):
             return self.get_roundrobin_express_key()
         return self.get_random_express_key()
 

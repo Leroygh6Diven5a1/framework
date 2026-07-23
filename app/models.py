@@ -23,10 +23,11 @@ class OpenAIMessage(BaseModel):
 class OpenAIRequest(BaseModel):
     model: str
     messages: list[OpenAIMessage]
-    temperature: float | None = 1.0
+    # 默认 None = 客户端未显式传入（便于区分“省略”与“显式 1.0”，从而应用控制台默认值/按模型剥离）
+    temperature: float | None = None
     max_tokens: int | None = None
     max_completion_tokens: int | None = None  # 兼容最新版 OpenAI 客户端
-    top_p: float | None = 1.0
+    top_p: float | None = None
     top_k: int | None = None
     stream: bool | None = False
     stop: list[str] | None = None
