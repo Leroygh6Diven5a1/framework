@@ -9,9 +9,11 @@ app_port: 7860
 
 # Vertex2OpenAI Express Adapter
 
-Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风格的 `/v1/chat/completions` 和 `/v1/models` 接口，对内支持调用 **Google Agent Platform / Vertex AI Express Mode 的 Gemini API** 或通过网页控制台进行**无头浏览器反代/直连（Cookie 模式）**。
+Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风格的 `/v1/chat/completions` 和 `/v1/models` 接口，对内支持调用 **Google Agent Platform（原 Vertex AI）Express Mode 的 Gemini API**，或通过网页控制台 **Cookie 直连反代（batchGraphql）**。
 
-> 当前版本已进行全面重构，支持**标准 API 模式**和**网页直连反代模式**的双上游切换。
+> 当前版本已进行全面重构，支持**标准 API 模式**和 **Cookie 直连反代模式**的双上游切换。
+>
+> 📌 **说明**：Google 已将 Vertex AI 更名为 **Agent Platform**，文档中相关表述已同步更新（部分历史标识符如环境变量 `VERTEX_EXPRESS_API_KEY`、SDK 参数 `vertexai=True` 为兼容性保留）。此外，**无头浏览器（Playwright）模式已移除**，Cookie 直连模式已完全替代它，部署更轻量。
 
 ## 功能特性
 
@@ -57,7 +59,7 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
 
 ## 网页反代直连模式配置指引 (支持手机与电脑)
 
-如果您在管理大盘中切换到 **Agent Platform Studio (无头浏览器反代)**，需要粘贴配置 **Cookie** 与 **Project ID**：
+如果您在管理大盘中切换到 **Agent Platform Studio (Cookie 直连反代)**，需要粘贴配置 **Cookie** 与 **Project ID**：
 
 ### 1. 获取完整的 Google Cookie
 因为关键的会话校验凭证（如 `__Secure-1PSIDTS`、`__Secure-1PSID`）带有 `HttpOnly` 安全属性，无法通过一般的书签脚本提取，必须通过以下方式获取：
@@ -75,7 +77,7 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
 - 在控制台顶部的项目选择器中复制项目 ID，或者直接复制您当前的浏览器地址栏网址 URL（形如：`https://console.cloud.google.com/vertex-ai/studio/multimodal?project=your-project-id`）。
 - 粘贴到大盘 Project ID 输入框中，系统会自动提取出干净的项目 ID。
 
-> ⚠️ **提示**：Google Cookie 的生命周期通常为 1~2 小时。过期后接口会报错（通常显示 `Permission Denied` 或 `predict denied`）。此时只需重新获取最新的 Cookie 并到大盘保存激活即可。
+> ⚠️ **提示**：Google Cookie 通常较为持久——只要不退出登录、不修改密码、Google 未主动失效会话，一般可维持**数周甚至更久**（实测可用一个月以上），并非只有 1~2 小时。仅当接口确实报 `Permission Denied` / `predict denied` 时，重新获取并到大盘保存激活即可。
 
 ---
 
@@ -203,3 +205,20 @@ python -m compileall app
 cd app
 uvicorn main:app --host 0.0.0.0 --port 7860
 ```
+
+---
+
+## 模型参数与控制台
+
+- 控制台（浏览器打开根路径 `/`，仅需输入密码，即 `API_KEY`）提供"模型参数"面板，可在线调整：思考强度（3.x 档位 / 2.5 预算）、生图分辨率与默认比例、采样默认值、输入图压缩、重试次数与退避、假流式/轮询/安全分显示、预填充兼容模式。
+- **参数优先级**：单次请求（OpenAI 请求体字段，如 `reasoning_effort`、`thinking_budget`、`image_size`、`aspect_ratio`，以及标准 `temperature`/`max_tokens` 等） > 控制台设置 > 内置默认。
+- **按模型能力自动裁剪**（`app/model_capabilities.py`）：不同模型支持的参数不同，代理会自动为每个模型剥离其不支持的参数，避免上游报错。依据官方文档：
+  - 自 **Gemini 3.6 Flash / 3.5 Flash-Lite 起（及所有更新/未来模型）**，`temperature`/`top_p`/`top_k` 已废弃（现忽略、未来 400），会被自动移除；更早的 3.x 仍可用但建议保持默认。
+  - **所有 Gemini 3.x** 不支持 `candidate_count`；改用 `thinking_level`（而非 `thinking_budget`）。
+  - **两个生图模型比例白名单不同**（pro-image 10 种 / flash-image 15 种），控制台按所选模型过滤，后端亦会校验并对不支持的比例回退为"由模型决定"。
+  - **预填充**：Gemini 3.6+ 拒绝以 model 轮次结尾（400）；代理内置"预填充智能兼容"，与模型名无关，自动处理。
+
+## 后续升级与扩展
+
+- **新增模型**：只需把模型 ID 加入 `vertexModels.json`（或远程 `MODELS_CONFIG_URL`）。`model_capabilities.py` 按**家族/版本模式**自动归类（思考方式、采样裁剪、生图比例/分辨率、预填充），**未知/未来型号按"最新代"前向安全处理**（自动移除已废弃采样参数、要求 user 结尾）。因此加新模型基本即插即用，无需改代码。
+- **迁移到 Interactions API**：代码按上游通道解耦（`app/upstreams/` 下各类实现 `BaseUpstream`；能力判定、消息转换、参数构建均为可复用模块）。待 Agent Platform 支持基础 Gemini 模型的 Interactions API 后，新增一个 `InteractionsUpstream`（实现 `BaseUpstream`）并在路由层接入即可，能力矩阵与预填充/参数逻辑可直接复用。当前 Agent Platform（Vertex）尚未对基础 Gemini 模型开放 Interactions（仅少数 agent），故暂未内置该通道。
