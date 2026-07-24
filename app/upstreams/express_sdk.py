@@ -41,13 +41,14 @@ def _normalize_model_name(model_name: str) -> tuple[str, bool, str | None]:
     return base_model_name, is_grounded_search, None
 
 
-def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_image_model: bool) -> dict | None:
+def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_image_model: bool,
+                           prefill_active: bool = False) -> dict | None:
     """按模型能力档案 + 控制台设置 + 单次请求构建思考配置（SDK 线格式）。"""
     if is_image_model:
         return None
 
-    settings = app_state.get_settings()
-    t = mc.resolve_thinking(base_model_name, request, settings)
+    settings = app_state.get_effective_settings(base_model_name)
+    t = mc.resolve_thinking(base_model_name, request, settings, prefill_active=prefill_active)
     if t.get("mode") is None:
         return None
 
@@ -112,20 +113,34 @@ class ExpressSDKUpstream(BaseUpstream):
         )
         print(f"🌐 [上游端点] 使用官方 Gemini Express Mode SDK 调用模型 {base_model_name}。")
 
-        is_image_model = "image" in request_obj.model.lower()
+        profile = mc.get_profile(base_model_name)
+        is_image_model = profile["is_image"]
 
-        # 预填充智能兼容：按控制台模式处理末尾 assistant 预填充（与模型名无关，新模型自动生效）
+        # 预填充智能兼容：按控制台模式 + 模型能力处理末尾 assistant 预填充（新模型自动生效）
+        # - 2.5 及更早（允许 model 结尾）：原生透传，模型直接续写；
+        # - 3.x（拒绝 model 结尾）：转成续写指令；
+        # - 两者都会把预填充文本拼回输出开头（带去重）。
         prefill_text = ""
+        prefill_active = False
         _prefill_mode = app_state.get_setting("prefill_mode", "smart")
         if _prefill_mode != "off":
-            new_msgs, prefill_text = apply_prefill_compat(request_obj.messages, _prefill_mode)
+            new_msgs, prefill_text, prefill_active = apply_prefill_compat(
+                request_obj.messages, _prefill_mode,
+                allow_model_last=not profile["requires_user_last_turn"],
+                instruction_template=app_state.get_setting("prefill_instruction", ""),
+            )
             if new_msgs is not request_obj.messages:
                 request_obj = request_obj.model_copy(update={"messages": new_msgs})
-            if prefill_text:
-                print(f"🩹 [预填充兼容] 已将末尾 assistant 预填充转为续写指令（{len(prefill_text)} 字），并将拼回输出开头。")
+                if prefill_text:
+                    print(f"🩹 [预填充兼容] 已将末尾 assistant 预填充转为续写指令（{len(prefill_text)} 字），并将拼回输出开头。")
+            elif prefill_text:
+                print(f"🩹 [预填充兼容] 该模型支持 model 结尾，预填充原生透传（{len(prefill_text)} 字），模型将直接续写。")
+            if prefill_active and app_state.get_setting("prefill_suppress_thinking", True):
+                print("🧠 [预填充兼容] 已按模型压制原生思考（可在控制台关闭），让预设思维链接管。")
 
         gen_config_dict = create_generation_config(request_obj)
-        thinking_config = _build_thinking_config(base_model_name, request_obj, is_image_model)
+        thinking_config = _build_thinking_config(base_model_name, request_obj, is_image_model,
+                                                 prefill_active=prefill_active)
         if thinking_config:
             gen_config_dict["thinking_config"] = thinking_config
 
