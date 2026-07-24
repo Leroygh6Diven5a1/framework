@@ -501,6 +501,22 @@ def _make_openai_chunk(
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
+def _sse_heartbeat() -> str:
+    """SSE 注释行心跳：符合 SSE 规范、被客户端忽略、不注入任何内容。
+    用于 429 退避等待期间保活连接，避免前端因长时间无字节而超时中断。"""
+    return ": keep-alive\n\n"
+
+
+async def _sleep_with_heartbeat(total_sec: float, hb_interval: float = 3.0):
+    """边等待边吐心跳的异步生成器：每 hb_interval 秒 yield 一次心跳，直到累计 total_sec。"""
+    waited = 0.0
+    step = max(0.5, min(hb_interval, total_sec)) if total_sec > 0 else 0
+    while waited < total_sec:
+        await asyncio.sleep(min(step, total_sec - waited))
+        waited += step
+        yield _sse_heartbeat()
+
+
 def _make_usage_chunk(response_id: str, model: str, usage: dict) -> str:
     """OpenAI 风格的用量尾块（choices 为空，仅携带 usage）"""
     chunk = {
@@ -805,6 +821,9 @@ class CookieProxyUpstream(BaseUpstream):
             async def stream_generator():
                 nonlocal start_time
 
+                # 立即吐一个心跳，尽快建立连接（避免首个上游调用较慢/429 时前端久等无字节）
+                yield _sse_heartbeat()
+
                 for attempt in range(retry_max + 1):
                     # 客户端已断开则立即停止，避免无谓的上游调用与重试
                     if await fastapi_request.is_disconnected():
@@ -904,7 +923,12 @@ class CookieProxyUpstream(BaseUpstream):
                             wait_sec = backoff_sec
                             stats.add_retry()
                             print(f"⚠️ [Studio] 遇到可重试拥堵/限流: {error_to_raise[:80]}... {wait_sec}s 后进行第 {attempt+2} 次退避重试")
-                            await asyncio.sleep(wait_sec)
+                            # 退避等待期间持续吐心跳，保活前端连接（issue4：3.1-pro 频繁 429 长等待易被前端断开）
+                            async for _hb in _sleep_with_heartbeat(wait_sec):
+                                if await fastapi_request.is_disconnected():
+                                    print("ℹ️ [Studio] 客户端已断开连接，取消后续重试。")
+                                    return
+                                yield _hb
                             start_time = time.time()
                             continue
 
