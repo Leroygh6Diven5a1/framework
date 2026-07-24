@@ -286,6 +286,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <input id="thinking_g25_budget" type="number" class="inp" placeholder="-1">
         </div>
         <p id="think-note" class="text-xs text-neutral-500 mt-2"></p>
+        <div class="mt-3 pt-3 border-t border-neutral-100 space-y-2">
+          <div class="flex items-center justify-between"><span class="text-sm">强制用此设置（忽略前端 reasoning_effort）</span><label class="switch"><input type="checkbox" id="thinking_force_console"><span class="slider"></span></label></div>
+          <div class="flex items-center justify-between"><span class="text-sm">隐藏思考过程（不返回 reasoning_content）</span><label class="switch"><input type="checkbox" id="hide_thoughts"><span class="slider"></span></label></div>
+          <p class="text-xs text-neutral-500 leading-relaxed">🎭 <b>酒馆预设"卡原生思维链"用法</b>：SillyTavern 常在每次请求发 <code>reasoning_effort</code>（如 xhigh），会覆盖上方档位。打开"强制用此设置"即忽略前端参数，把上方档位（或该模型专属值）设为 <code>minimal</code>（2.5 设 <code>0</code>）即可最大限度压掉原生思考；再开"隐藏思考过程"则连 reasoning_content 也不返回。（预填充模式的压制开关见"开关 &amp; 预填充"卡片，二者独立。）</p>
+        </div>
       </div>
 
       <!-- 生图 -->
@@ -352,13 +357,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <div class="lbl mb-1">续写指令模板（留空=内置默认；预填充文本自动附在其后）</div>
             <textarea id="prefill_instruction" rows="2" class="inp log" placeholder="[继续输出] 下面是你这条回复已经写好的开头，请从断点处无缝继续，不要重复开头内容，也不要添加任何前言、解释或标注："></textarea>
           </div>
-          <p class="text-xs text-neutral-500 leading-relaxed">智能模式：2.5 及更早模型<b>原生透传</b>预填充（模型直接续写）；3.x 拒绝 model 结尾，自动转为末尾 user 续写指令。两者都会把预填充拼回输出开头并自动去重。压制思考时：3.x 压至最低档并不回传思考（无法全关），2.5-flash 预算 0 全关、2.5-pro 降至 128；单次请求显式传 reasoning_effort / thinking_budget 时不压制。</p>
+          <p class="text-xs text-neutral-500 leading-relaxed">智能模式：2.5 及更早模型<b>原生透传</b>预填充（模型直接续写）；3.x 拒绝 model 结尾，自动转为末尾 user 续写指令。两者都会把预填充拼回输出开头并自动去重。压制思考时：3.x 压至最低档并不回传思考（无法全关），2.5-flash 预算 0 全关、2.5-pro 降至 128。<b>注意：预填充压制仅在请求真的带预填充时触发；若你的酒馆预设把思维链写在 system 提示里（无预填充），请改用上方“思考强度”卡片的“强制用此设置”。</b></p>
         </div>
       </div>
     </div>
 
-    <div class="flex justify-end mt-4">
-      <button class="btn px-5 py-2.5 text-sm" onclick="saveSettings()">保存设置</button>
+    <div class="flex items-center justify-end gap-3 mt-4">
+      <span class="text-xs text-neutral-500">此按钮保存<b>全局默认 + 基础设施项</b>，不影响已设专属参数的模型</span>
+      <button class="btn px-5 py-2.5 text-sm" onclick="saveSettings()">保存全局设置</button>
     </div>
   </section>
 
@@ -452,7 +458,7 @@ async function loadParams(){
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
     ['thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','prefill_suppress_thinking'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','prefill_suppress_thinking','thinking_force_console','hide_thoughts'].forEach(k=>setV(k,s[k]));
   }catch(e){}
   try{
     const c=await (await fetch('/api/capabilities')).json();
@@ -577,6 +583,8 @@ async function saveSettings(){
     cookie_debug:$('cookie_debug').checked,
     prefill_mode:$('prefill_mode').value,
     prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
+    thinking_force_console:$('thinking_force_console').checked,
+    hide_thoughts:$('hide_thoughts').checked,
     prefill_instruction:$('prefill_instruction').value,
   };
   // 7 个可覆盖参数：仅当所选模型“没有专属配置”时，才作为全局默认保存，
@@ -594,6 +602,10 @@ async function saveSettings(){
       default_max_tokens:numOrNull('default_max_tokens'),
     });
   }
+  const scope = overriding
+    ? '将保存全局的基础设施项（图压缩/重试/假流式/预填充/思考控制开关等）。\n当前所选模型有专属思考/生图/采样参数，不会被改动。'
+    : '将保存为全局默认，影响所有【未设置专属参数】的模型。\n已设专属参数的模型不受影响。';
+  if(!confirm(scope + '\n\n确定保存全局设置吗？')) return;
   try{
     const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
     if(r.ok){ GLOBAL_SETTINGS=await r.json(); toast(overriding?'已保存全局(基础设施)设置；该模型的思考/生图/采样为专属值，未改全局':'全局设置已保存'); }

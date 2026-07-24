@@ -152,11 +152,29 @@ def get_profile(model_name: str) -> Dict[str, Any]:
     }
 
 
+# 客户端 reasoning_effort 归一化（SillyTavern 等会发 min/minimal/max/xhigh/auto 等）
+_EFFORT_ALIASES = {
+    "min": "minimal", "minimal": "minimal",
+    "low": "low", "medium": "medium", "med": "medium",
+    "high": "high", "max": "high", "xhigh": "high", "x-high": "high", "very_high": "high",
+    "none": "off", "off": "off",
+}
+
+
+def _norm_effort(e: Optional[str]) -> Optional[str]:
+    if not isinstance(e, str):
+        return None
+    s = e.strip().lower()
+    if not s or s == "auto":
+        return None  # auto/空 → 交给控制台/模型默认
+    return _EFFORT_ALIASES.get(s, s)
+
+
 def _effort(request: Any) -> Optional[str]:
     e = getattr(request, "reasoning_effort", None)
     if not e and getattr(request, "model_extra", None):
         e = request.model_extra.get("reasoning_effort")
-    return e.lower() if isinstance(e, str) else None
+    return _norm_effort(e)
 
 
 def _extra(request: Any, key: str) -> Any:
@@ -170,12 +188,17 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
                      prefill_active: bool = False) -> Dict[str, Any]:
     """
     计算思考配置（中立结构，各通道再转成自己的线格式）。
-    优先级：单次请求 > 预填充压制 > 控制台设置 > 家族默认。
     返回 {"mode": None} 或 {"mode":"level","level":..} 或 {"mode":"budget","budget":..}
 
-    prefill_active=True 且控制台开启 prefill_suppress_thinking（默认开）时，
-    把思考压到该模型最低（3.x=minimal/low 且不回传思考；2.5-flash=0 全关、2.5-pro=128），
-    让 roleplay 预设里的“预填充卡思维链”真正生效；单次请求显式指定思考时不压制。
+    优先级（默认）：单次请求 reasoning_effort/thinking_budget > 控制台/该模型专属 > 家族默认。
+
+    三个控制台开关改变上述行为（专为酒馆预设"卡原生思维链"设计）：
+    - thinking_force_console（默认关）：**忽略**前端发来的 reasoning_effort/thinking_budget，
+      强制用控制台/该模型专属设置（未设则模型默认）。适配 SillyTavern 恒发 reasoning_effort=xhigh
+      导致控制台设置被覆盖的情况。
+    - prefill_suppress_thinking（默认开）：检测到预填充时，把思考压到该模型最低并隐藏思考
+      （3.x=minimal/low；2.5-flash=0 全关、2.5-pro=128）。此路径同样忽略前端 effort。
+    - hide_thoughts（默认关）：强制 include_thoughts=false，不回传思考内容（reasoning_content）。
     """
     prof = get_profile(model_name)
     if prof["is_image"] or prof["thinking_kind"] is None:
@@ -183,29 +206,37 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
 
     settings = settings or {}
     suppress = bool(prefill_active and settings.get("prefill_suppress_thinking", True))
+    force_console = bool(settings.get("thinking_force_console", False))
+    hide = bool(settings.get("hide_thoughts", False))
+    # 忽略前端思考参数：预填充压制 或 强制控制台 时
+    ignore_client = suppress or force_console
+
+    req_effort = None if ignore_client else _effort(request)
+    req_budget = None if ignore_client else _extra(request, "thinking_budget")
+    include_thoughts = not (hide or suppress)
 
     if prof["thinking_kind"] == "level":
         levels = prof["thinking_levels"]
-        if suppress and _effort(request) is None:
+        if suppress:
+            # 压制：3.x 无法完全关闭思考 → 压到最低档并隐藏
             level = "minimal" if "minimal" in levels else "low"
-            # 3.x 无法完全关闭思考：压到最低档并不回传思考内容（官方 thinking 文档）
             return {"mode": "level", "level": level, "include_thoughts": False}
-        level = _effort(request) or settings.get("thinking_g3_level") or prof.get("default_level", "high")
+        level = req_effort or settings.get("thinking_g3_level") or prof.get("default_level", "high")
         level = str(level).lower()
         if level in ("off", "none"):
             level = "minimal" if "minimal" in levels else "low"
         if level not in levels:
             level = "high" if "high" in levels else sorted(levels)[-1]
-        return {"mode": "level", "level": level, "include_thoughts": True}
+        return {"mode": "level", "level": level, "include_thoughts": include_thoughts}
 
     # budget（2.5）
     bmin, bmax, can_zero = prof["budget_min"], prof["budget_max"], prof["budget_can_zero"]
-    rb = _extra(request, "thinking_budget")
-    eff = _effort(request)
-    if suppress and rb is None and eff is None:
+    if suppress:
         # 2.5-flash 可预算 0 完全关闭；2.5-pro 最低 128（无法全关）
         budget = 0 if can_zero else bmin
         return {"mode": "budget", "budget": budget, "include_thoughts": False}
+    rb = req_budget
+    eff = req_effort
     if rb is not None:
         try:
             budget = int(rb)
@@ -215,6 +246,8 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
         budget = max(bmin, 1024)
     elif eff in ("medium", "high"):
         budget = -1
+    elif eff == "minimal":
+        budget = 0 if can_zero else bmin
     else:
         try:
             budget = int(settings.get("thinking_g25_budget", -1))
@@ -224,7 +257,7 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
         budget = bmin
     if budget != -1:
         budget = max(bmin, min(bmax, budget))
-    return {"mode": "budget", "budget": budget, "include_thoughts": True}
+    return {"mode": "budget", "budget": budget, "include_thoughts": include_thoughts}
 
 
 def sanitize_sampling(config: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:

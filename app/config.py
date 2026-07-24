@@ -81,8 +81,13 @@ DEFAULT_SETTINGS = {
     "prefill_mode": "smart",
     # 预填充触发时压制原生思考（“卡思维链”核心开关）：
     # 3.x 压到最低档（minimal/低于则 low）并关闭思考回传；2.5-flash 预算设 0 全关、2.5-pro 降到最低 128。
-    # 单次请求显式传 reasoning_effort / thinking_budget 时不压制（请求优先）。
+    # 此路径会忽略前端 effort（预填充时优先）。
     "prefill_suppress_thinking": True,
+    # 强制使用控制台/该模型专属思考设置，忽略前端发来的 reasoning_effort / thinking_budget。
+    # 适配 SillyTavern 等恒发 reasoning_effort（如 xhigh）覆盖控制台的情况——酒馆预设“卡原生思维链”必备。
+    "thinking_force_console": False,
+    # 隐藏思考过程：强制 include_thoughts=false，不回传 reasoning_content。
+    "hide_thoughts": False,
     # smart 模式续写指令模板（留空=用内置默认；预填充文本会自动附在模板之后）
     "prefill_instruction": "",
     # Cookie 通道调试：打印出站 generationConfig（无正文时的原始响应样本总是自动记录，无需开启）

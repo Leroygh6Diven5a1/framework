@@ -696,6 +696,8 @@ async def execute_gemini_call(
                 except (TypeError, ValueError):
                     max_retries = 20
                 has_yielded = False  # 是否已向客户端输出过内容
+                # 立即吐一个 SSE 心跳，尽快建立连接（429 重试期间也保活，防前端超时中断）
+                yield ": keep-alive\n\n"
                 for attempt in range(max_retries):
                     # 客户端断开则停止重试，避免无谓的上游调用
                     if await _client_gone():
@@ -770,7 +772,15 @@ async def execute_gemini_call(
                             if await _client_gone():
                                 print(f"ℹ️ [客户端断开] 重试前检测到客户端已断开，停止调用模型 {model_to_call}。")
                                 return
-                            await asyncio.sleep(wait_time)
+                            # 退避等待期间持续吐 SSE 心跳，保活前端连接
+                            _waited = 0.0
+                            while _waited < wait_time:
+                                await asyncio.sleep(min(3.0, wait_time - _waited))
+                                _waited += 3.0
+                                if await _client_gone():
+                                    print(f"ℹ️ [客户端断开] 重试等待期间检测到客户端已断开，停止调用模型 {model_to_call}。")
+                                    return
+                                yield ": keep-alive\n\n"
                             continue
 
                         err_msg_detail_stream = f"Gemini 流式请求异常（模型：{model_to_call}）：{type(e_stream_call).__name__} - {str(e_stream_call)}"
