@@ -69,6 +69,16 @@ COOKIE_REFRESH_HINT = (
     "复制任意请求的 Cookie 头（或用 Cookie-Editor 导出），到大盘粘贴保存。"
 )
 
+# “只有思考没有正文”的可操作提示：多为原生思考在高强度下跑飞/被截断（尤其酒馆预设 + 前端恒发 xhigh）。
+_THINKING_RUNAWAY_HINT = (
+    "这通常是原生思考在高强度下跑飞或被截断（前端如 SillyTavern 常发 reasoning_effort=xhigh，"
+    "会覆盖控制台档位）。解决：控制台“模型参数→思考强度→原生思考控制”选“关闭原生思考”"
+    "（可用“保存为该模型专属”只对本模型生效），即忽略前端强度、压到 minimal 并剥离原生思考。"
+)
+_NO_BODY_HINT = (
+    "可能被安全策略拦截或接口行为变化；原始响应样本已写入运行日志，可到大盘“运行日志”页查看。"
+)
+
 
 def _is_retryable_error(error_msg: str) -> bool:
     """判断错误是否可重试（429 限流类）"""
@@ -774,6 +784,14 @@ class CookieProxyUpstream(BaseUpstream):
         want_usage = _wants_usage(request_obj)
         cookie_debug = bool(app_state.get_setting("cookie_debug", False))
 
+        # batchGraphql(Studio) 会忽略 includeThoughts=false（真机验证），因此当解析出的思考配置
+        # 要求不回传思考时，由本通道在响应侧主动剥离思考块。生图无思考，strip 恒 False。
+        _eff_settings = app_state.get_effective_settings(base_model_name)
+        _tk = mc.resolve_thinking(base_model_name, request_obj, _eff_settings, prefill_active=prefill_active)
+        strip_thoughts = bool(_tk.get("mode") and not _tk.get("include_thoughts", True))
+        if strip_thoughts and cookie_debug:
+            print("🔎 [Studio 调试] 已启用响应侧思考剥离（batchGraphql 不支持 includeThoughts=false）。")
+
         # 打印请求日志
         msg_count = len(request_obj.messages)
         print(f"→ [Studio] {base_model_name} | {msg_count} 条消息 | {'流式' if is_stream else '非流式'}")
@@ -853,6 +871,12 @@ class CookieProxyUpstream(BaseUpstream):
                         async for status, data in _execute_stream_request_generator(
                             client, req_headers, body, sampler=sampler
                         ):
+                            # 思考剥离：batchGraphql 忽略 includeThoughts，这里按解析出的配置主动丢弃思考块
+                            if status == "thought":
+                                got_thought = True
+                                if strip_thoughts:
+                                    continue  # 不建连、不输出，等真正的正文
+
                             if status in ("text", "thought", "image", "api_error_text"):
                                 if not has_yielded_to_client:
                                     print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
@@ -863,7 +887,6 @@ class CookieProxyUpstream(BaseUpstream):
                                         yield _make_openai_chunk(response_id, model_display, content=prefill_text)
 
                                 if status == "thought":
-                                    got_thought = True
                                     yield _make_openai_chunk(response_id, model_display, reasoning_content=data)
                                 elif status == "api_error_text":
                                     yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio API 错误] {data}")
@@ -954,13 +977,13 @@ class CookieProxyUpstream(BaseUpstream):
                             if blocked_msg:
                                 detail += f"；promptFeedback 拦截：{blocked_msg}"
                             desc = "只返回了思考、未返回正文" if got_thought else "未返回任何内容"
+                            hint = (_THINKING_RUNAWAY_HINT if (got_thought and not strip_thoughts) else _NO_BODY_HINT)
                             stats.add_error()
                             print(f"❌ [Studio] {base_model_name} | 上游{desc}（{detail}）")
                             print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
                             yield _make_openai_chunk(
                                 response_id, model_display,
-                                content=(f"\n[Studio 提示] 上游{desc}（{detail}）。"
-                                         f"可能被安全策略拦截或接口行为变化；原始响应样本已写入运行日志，可到大盘“运行日志”页查看。"))
+                                content=f"\n[Studio 提示] 上游{desc}（{detail}）。{hint}")
                             filtered = bool(blocked_msg) or ((finish_raw or "").upper() in _FINISH_FILTERED)
                             yield _make_openai_chunk(response_id, model_display,
                                                      finish_reason="content_filter" if filtered else "stop")
@@ -1036,7 +1059,7 @@ class CookieProxyUpstream(BaseUpstream):
                             if event_type == "text":
                                 full_text += data
                             elif event_type == "thought":
-                                reasoning_text += data
+                                reasoning_text += data   # 先收集（供诊断判断），输出时按 strip 决定是否附带
                             elif event_type == "image":
                                 full_text += data
                             elif event_type == "finish":
@@ -1075,18 +1098,18 @@ class CookieProxyUpstream(BaseUpstream):
                         if blocked_msg:
                             detail += f"；promptFeedback 拦截：{blocked_msg}"
                         desc = "只返回了思考、未返回正文" if reasoning_text else "未返回任何内容"
+                        hint = (_THINKING_RUNAWAY_HINT if (reasoning_text and not strip_thoughts) else _NO_BODY_HINT)
                         stats.add_error()
                         print(f"❌ [Studio] {base_model_name} | 上游{desc}（{detail}）| {elapsed:.1f}s")
                         print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
-                        full_text = (f"[Studio 提示] 上游{desc}（{detail}）。"
-                                     f"可能被安全策略拦截或接口行为变化；原始响应样本已写入运行日志。")
+                        full_text = f"[Studio 提示] 上游{desc}（{detail}）。{hint}"
                         filtered = bool(blocked_msg) or ((finish_raw or "").upper() in _FINISH_FILTERED)
                         finish_reason = "content_filter" if filtered else "stop"
 
                     usage = _map_usage(usage_meta)
 
                     message_obj = {"role": "assistant", "content": full_text}
-                    if reasoning_text:
+                    if reasoning_text and not strip_thoughts:   # strip：batchGraphql 忽略 includeThoughts，输出侧剥离
                         message_obj["reasoning_content"] = reasoning_text
 
                     return JSONResponse(content={
