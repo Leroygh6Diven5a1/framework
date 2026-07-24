@@ -192,28 +192,40 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
 
     优先级（默认）：单次请求 reasoning_effort/thinking_budget > 控制台/该模型专属 > 家族默认。
 
-    三个控制台开关改变上述行为（专为酒馆预设"卡原生思维链"设计）：
-    - thinking_force_console（默认关）：**忽略**前端发来的 reasoning_effort/thinking_budget，
-      强制用控制台/该模型专属设置（未设则模型默认）。适配 SillyTavern 恒发 reasoning_effort=xhigh
-      导致控制台设置被覆盖的情况。
-    - prefill_suppress_thinking（默认开）：检测到预填充时，把思考压到该模型最低并隐藏思考
-      （3.x=minimal/low；2.5-flash=0 全关、2.5-pro=128）。此路径同样忽略前端 effort。
-    - hide_thoughts（默认关）：强制 include_thoughts=false，不回传思考内容（reasoning_content）。
+    控制台 native_thinking_mode（原生思考控制，向后兼容旧 hide_thoughts/thinking_force_console 布尔）：
+    - "request"（默认）：跟随请求 effort（无则控制台/模型默认），返回思考。
+    - "off"（关闭原生思考，酒馆预设推荐）：把思考压到该模型最低（3.x=minimal/low；2.5-flash=0、
+      2.5-pro=128），忽略前端 effort，并 include_thoughts=False。**重要：batchGraphql(Studio) 会忽略
+      includeThoughts，故 Cookie 通道还需在响应侧剥离思考块（见 chat_completions）；把档位压到 minimal
+      才是 Studio 下真正减少原生思考、避免重预设思考阶段被截断的关键（已真机验证）。**
+    - "console"（强制控制台档位）：忽略前端 effort，用控制台/该模型专属档位（未设则模型默认），返回思考。
+
+    另外 prefill_suppress_thinking（默认开）：检测到预填充时等效走 "off" 压制路径。
     """
     prof = get_profile(model_name)
     if prof["is_image"] or prof["thinking_kind"] is None:
         return {"mode": None}
 
     settings = settings or {}
-    suppress = bool(prefill_active and settings.get("prefill_suppress_thinking", True))
-    force_console = bool(settings.get("thinking_force_console", False))
-    hide = bool(settings.get("hide_thoughts", False))
-    # 忽略前端思考参数：预填充压制 或 强制控制台 时
-    ignore_client = suppress or force_console
+
+    # 统一的“原生思考控制”模式：request（跟随请求）| off（关闭原生思考）| console（强制控制台档位）
+    # 向后兼容旧布尔开关（上一版的 hide_thoughts / thinking_force_console）。
+    mode = settings.get("native_thinking_mode")
+    if mode not in ("request", "off", "console"):
+        if settings.get("hide_thoughts"):
+            mode = "off"
+        elif settings.get("thinking_force_console"):
+            mode = "console"
+        else:
+            mode = "request"
+
+    # suppress = 关闭原生思考（压到最低 + 隐藏 + 忽略前端）。预填充压制也走这条路。
+    suppress = bool(mode == "off" or (prefill_active and settings.get("prefill_suppress_thinking", True)))
+    ignore_client = bool(suppress or mode == "console")
 
     req_effort = None if ignore_client else _effort(request)
     req_budget = None if ignore_client else _extra(request, "thinking_budget")
-    include_thoughts = not (hide or suppress)
+    include_thoughts = not suppress
 
     if prof["thinking_kind"] == "level":
         levels = prof["thinking_levels"]

@@ -83,10 +83,14 @@ DEFAULT_SETTINGS = {
     # 3.x 压到最低档（minimal/低于则 low）并关闭思考回传；2.5-flash 预算设 0 全关、2.5-pro 降到最低 128。
     # 此路径会忽略前端 effort（预填充时优先）。
     "prefill_suppress_thinking": True,
-    # 强制使用控制台/该模型专属思考设置，忽略前端发来的 reasoning_effort / thinking_budget。
-    # 适配 SillyTavern 等恒发 reasoning_effort（如 xhigh）覆盖控制台的情况——酒馆预设“卡原生思维链”必备。
+    # 原生思考控制（酒馆预设“卡原生思维链”核心）：
+    #   request = 跟随前端 reasoning_effort（默认）
+    #   off     = 关闭原生思考：压到该模型最低档 + 忽略前端 effort + 不回传思考
+    #             （Studio/batchGraphql 忽略 includeThoughts，故 Cookie 通道会在响应侧剥离思考块）
+    #   console = 忽略前端 effort，强制用控制台/该模型专属档位
+    "native_thinking_mode": "request",
+    # —— 以下两个为上一版布尔开关，保留仅作向后兼容（新 UI 用 native_thinking_mode）——
     "thinking_force_console": False,
-    # 隐藏思考过程：强制 include_thoughts=false，不回传 reasoning_content。
     "hide_thoughts": False,
     # smart 模式续写指令模板（留空=用内置默认；预填充文本会自动附在模板之后）
     "prefill_instruction": "",
@@ -100,6 +104,7 @@ DEFAULT_SETTINGS = {
 # 允许按模型单独保存（覆盖全局默认）的参数键。
 # 其余为基础设施级（图压缩/重试/假流式/预填充/安全分/调试等），保持全局唯一。
 PER_MODEL_KEYS = [
+    "native_thinking_mode",
     "thinking_g3_level",
     "thinking_g25_budget",
     "image_size",

@@ -286,10 +286,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <input id="thinking_g25_budget" type="number" class="inp" placeholder="-1">
         </div>
         <p id="think-note" class="text-xs text-neutral-500 mt-2"></p>
-        <div class="mt-3 pt-3 border-t border-neutral-100 space-y-2">
-          <div class="flex items-center justify-between"><span class="text-sm">强制用此设置（忽略前端 reasoning_effort）</span><label class="switch"><input type="checkbox" id="thinking_force_console"><span class="slider"></span></label></div>
-          <div class="flex items-center justify-between"><span class="text-sm">隐藏思考过程（不返回 reasoning_content）</span><label class="switch"><input type="checkbox" id="hide_thoughts"><span class="slider"></span></label></div>
-          <p class="text-xs text-neutral-500 leading-relaxed">🎭 <b>酒馆预设"卡原生思维链"用法</b>：SillyTavern 常在每次请求发 <code>reasoning_effort</code>（如 xhigh），会覆盖上方档位。打开"强制用此设置"即忽略前端参数，把上方档位（或该模型专属值）设为 <code>minimal</code>（2.5 设 <code>0</code>）即可最大限度压掉原生思考；再开"隐藏思考过程"则连 reasoning_content 也不返回。（预填充模式的压制开关见"开关 &amp; 预填充"卡片，二者独立。）</p>
+        <div class="mt-3 pt-3 border-t border-neutral-100">
+          <div class="lbl mb-1">原生思考控制（native_thinking_mode）</div>
+          <select id="native_thinking_mode" class="inp">
+            <option value="request">跟随请求（默认）</option>
+            <option value="off">关闭原生思考（角色扮演推荐）</option>
+            <option value="console">强制用上方档位（忽略前端）</option>
+          </select>
+          <p class="text-xs text-neutral-500 mt-2 leading-relaxed">🎭 <b>酒馆预设"卡原生思维链"选“关闭原生思考”即可（可用“保存为该模型专属”只对 3.6-flash 生效）。</b><br>• <b>跟随请求</b>：用前端发来的 <code>reasoning_effort</code>；SillyTavern 常发 <code>xhigh</code> → 高强度原生思考。<br>• <b>关闭原生思考</b>：忽略前端参数，把档位压到该模型最低（3.x=minimal、2.5-flash 预算 0），并<b>不返回思考</b>。⚠️ 实测 Studio(batchGraphql) 会忽略 includeThoughts，故本项会在<b>压到 minimal</b> 的同时于响应侧<b>剥离思考块</b>——这也是重预设下 3.6-flash 能出正文（不被思考阶段截断）的关键。<br>• <b>强制用上方档位</b>：忽略前端，用你在上面选的档位（返回思考）。<br>（预填充预设另见"开关 &amp; 预填充"卡片的压制开关。）</p>
         </div>
       </div>
 
@@ -385,7 +389,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let CAPS = {}, chart = null, curAR = "";
 let GLOBAL_SETTINGS = {}, OVERRIDES = {};
-const PER_MODEL_KEYS = ['thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens'];
+const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens'];
 const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1800); }
@@ -457,8 +461,13 @@ async function loadParams(){
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','prefill_suppress_thinking','thinking_force_console','hide_thoughts'].forEach(k=>setV(k,s[k]));
+    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','prefill_suppress_thinking'].forEach(k=>setV(k,s[k]));
+    // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
+    if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
+      if(s.hide_thoughts) setV('native_thinking_mode','off');
+      else if(s.thinking_force_console) setV('native_thinking_mode','console');
+    }
   }catch(e){}
   try{
     const c=await (await fetch('/api/capabilities')).json();
@@ -483,6 +492,7 @@ function applyModelParamFields(model){
 async function saveModelOverride(){
   const m=$('model-sel').value; if(!m) return;
   const patch={
+    native_thinking_mode:$('native_thinking_mode').value,
     thinking_g3_level:$('thinking_g3_level').value,
     thinking_g25_budget:numOr('thinking_g25_budget',-1),
     image_size:$('image_size').value,
@@ -583,8 +593,6 @@ async function saveSettings(){
     cookie_debug:$('cookie_debug').checked,
     prefill_mode:$('prefill_mode').value,
     prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
-    thinking_force_console:$('thinking_force_console').checked,
-    hide_thoughts:$('hide_thoughts').checked,
     prefill_instruction:$('prefill_instruction').value,
   };
   // 7 个可覆盖参数：仅当所选模型“没有专属配置”时，才作为全局默认保存，
@@ -593,6 +601,7 @@ async function saveSettings(){
   const overriding = !!(OVERRIDES[m] && Object.keys(OVERRIDES[m]).length>0);
   if(!overriding){
     Object.assign(patch,{
+      native_thinking_mode:$('native_thinking_mode').value,
       thinking_g3_level:$('thinking_g3_level').value,
       thinking_g25_budget:numOr('thinking_g25_budget',-1),
       image_size:$('image_size').value,
