@@ -166,20 +166,30 @@ def _extra(request: Any, key: str) -> Any:
     return v
 
 
-def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any]) -> Dict[str, Any]:
+def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
+                     prefill_active: bool = False) -> Dict[str, Any]:
     """
     计算思考配置（中立结构，各通道再转成自己的线格式）。
-    优先级：单次请求 > 控制台设置 > 家族默认。
+    优先级：单次请求 > 预填充压制 > 控制台设置 > 家族默认。
     返回 {"mode": None} 或 {"mode":"level","level":..} 或 {"mode":"budget","budget":..}
+
+    prefill_active=True 且控制台开启 prefill_suppress_thinking（默认开）时，
+    把思考压到该模型最低（3.x=minimal/low 且不回传思考；2.5-flash=0 全关、2.5-pro=128），
+    让 roleplay 预设里的“预填充卡思维链”真正生效；单次请求显式指定思考时不压制。
     """
     prof = get_profile(model_name)
     if prof["is_image"] or prof["thinking_kind"] is None:
         return {"mode": None}
 
     settings = settings or {}
+    suppress = bool(prefill_active and settings.get("prefill_suppress_thinking", True))
 
     if prof["thinking_kind"] == "level":
         levels = prof["thinking_levels"]
+        if suppress and _effort(request) is None:
+            level = "minimal" if "minimal" in levels else "low"
+            # 3.x 无法完全关闭思考：压到最低档并不回传思考内容（官方 thinking 文档）
+            return {"mode": "level", "level": level, "include_thoughts": False}
         level = _effort(request) or settings.get("thinking_g3_level") or prof.get("default_level", "high")
         level = str(level).lower()
         if level in ("off", "none"):
@@ -192,6 +202,10 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any]) ->
     bmin, bmax, can_zero = prof["budget_min"], prof["budget_max"], prof["budget_can_zero"]
     rb = _extra(request, "thinking_budget")
     eff = _effort(request)
+    if suppress and rb is None and eff is None:
+        # 2.5-flash 可预算 0 完全关闭；2.5-pro 最低 128（无法全关）
+        budget = 0 if can_zero else bmin
+        return {"mode": "budget", "budget": budget, "include_thoughts": False}
     if rb is not None:
         try:
             budget = int(rb)

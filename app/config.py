@@ -79,4 +79,27 @@ DEFAULT_SETTINGS = {
     "safety_score": SAFETY_SCORE,
     # 预填充兼容模式: smart|minimal|off
     "prefill_mode": "smart",
+    # 预填充触发时压制原生思考（“卡思维链”核心开关）：
+    # 3.x 压到最低档（minimal/低于则 low）并关闭思考回传；2.5-flash 预算设 0 全关、2.5-pro 降到最低 128。
+    # 单次请求显式传 reasoning_effort / thinking_budget 时不压制（请求优先）。
+    "prefill_suppress_thinking": True,
+    # smart 模式续写指令模板（留空=用内置默认；预填充文本会自动附在模板之后）
+    "prefill_instruction": "",
+    # Cookie 通道调试：打印出站 generationConfig（无正文时的原始响应样本总是自动记录，无需开启）
+    "cookie_debug": False,
+    # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
+    # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
+    "model_overrides": {},
 }
+
+# 允许按模型单独保存（覆盖全局默认）的参数键。
+# 其余为基础设施级（图压缩/重试/假流式/预填充/安全分/调试等），保持全局唯一。
+PER_MODEL_KEYS = [
+    "thinking_g3_level",
+    "thinking_g25_budget",
+    "image_size",
+    "image_aspect_ratio",
+    "default_temperature",
+    "default_top_p",
+    "default_max_tokens",
+]

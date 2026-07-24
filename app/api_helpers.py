@@ -16,7 +16,9 @@ from models import OpenAIRequest, OpenAIMessage
 from message_processing import (
     convert_to_openai_format,
     extract_reasoning_by_tags,
-    _create_safety_ratings_html
+    _create_safety_ratings_html,
+    strip_prefill_overlap,
+    PrefillDeduper,
 )
 import config as app_config
 from config import VERTEX_REASONING_TAG
@@ -140,6 +142,35 @@ def create_openai_error_response(status_code: int, message: str, error_type: str
         }
     }
 
+def extract_upstream_error(e: Exception) -> tuple[int, str]:
+    """从上游异常里尽力提取 (HTTP 状态码, 简明消息)。
+
+    google-genai 的 ClientError/ServerError 带 .code 与结构化 message；
+    其余异常回退 500 + 类名+摘要。用于把 404/403/400 等如实透传给客户端，
+    避免笼统的 500 Internal Server Error。
+    """
+    code = getattr(e, "code", None) or getattr(e, "status_code", None)
+    msg = str(e)
+    # 从形如 "{'error': {'code':404,'message':...}}" 的 message 里提取更干净的说明
+    try:
+        m = re.search(r"'message':\s*'([^']+)'", msg) or re.search(r'"message":\s*"([^"]+)"', msg)
+        if m:
+            msg = m.group(1)
+    except Exception:
+        pass
+    if not isinstance(code, int) or not (400 <= code <= 599):
+        low = str(e).lower()
+        if "not found" in low or "404" in low:
+            code = 404
+        elif "permission" in low or "403" in low or "denied" in low:
+            code = 403
+        elif "invalid" in low or "400" in low:
+            code = 400
+        else:
+            code = 500
+    return code, msg
+
+
 def is_retryable_exception(e):
     error_str = str(e).lower()
     if isinstance(e, httpx.HTTPStatusError) and e.response.status_code in [429, 503, 502]:
@@ -251,8 +282,8 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
         if function_declarations:
             tools_list.append({"function_declarations": function_declarations})
 
-    # 读取控制台设置与模型能力档案（优先级：单次请求 > 控制台 > 内置默认）
-    settings = app_state.get_settings()
+    # 读取控制台设置与模型能力档案（优先级：单次请求 > 模型专属 > 全局 > 内置默认）
+    settings = app_state.get_effective_settings(request.model)
     profile = mc.get_profile(request.model)
     is_image_model = profile["is_image"]
 
@@ -496,7 +527,7 @@ async def _chunk_openai_response_dict_for_sse(
     yield "data: [DONE]\n\n"
 
 def _prepend_prefill(openai_dict: Dict[str, Any], prefill_text: str) -> Dict[str, Any]:
-    """把预填充文本拼回到最终输出开头（预填充智能兼容用）。"""
+    """把预填充文本拼回到最终输出开头（预填充智能兼容用，带重叠去重）。"""
     if not prefill_text:
         return openai_dict
     try:
@@ -504,12 +535,52 @@ def _prepend_prefill(openai_dict: Dict[str, Any], prefill_text: str) -> Dict[str
             msg = choice.get("message")
             if not isinstance(msg, dict) or msg.get("tool_calls"):
                 continue
-            existing = msg.get("content")
-            msg["content"] = prefill_text + (existing or "")
+            existing = msg.get("content") or ""
+            msg["content"] = prefill_text + strip_prefill_overlap(prefill_text, existing)
             break
     except Exception:
         pass
     return openai_dict
+
+
+def _dedup_sse_chunk_content(sse_line: str, deduper: PrefillDeduper, force_flush: bool = False) -> Optional[str]:
+    """真流式预填充去重：改写单条 SSE chunk 的 delta.content。
+
+    - 去重器工作期间，正文会先被攒下（返回 None 表示该 chunk 可整条跳过）；
+      判定完成后原样透传，零额外延迟。
+    - force_flush=True 或 chunk 带 finish_reason 时，把攒着的文本一并放出，
+      避免正文落在 finish 之后（部分客户端在 finish 后停止读取）。
+    """
+    if deduper.done and not force_flush:
+        return sse_line
+    try:
+        payload = json.loads(sse_line[len("data: "):].strip())
+        choices = payload.get("choices") or []
+        if not choices:
+            return sse_line
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        content = delta.get("content")
+        has_finish = bool(choice.get("finish_reason"))
+
+        out = deduper.feed(content) if content else ""
+        if has_finish or force_flush:
+            out += deduper.flush()
+
+        if out:
+            delta["content"] = out
+            choice["delta"] = delta
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        # 没有可放出的正文：若 chunk 还有其他信息（角色/思考/finish 等）则去掉 content 保留其余
+        if content is not None:
+            delta.pop("content", None)
+        if delta or has_finish:
+            choice["delta"] = delta
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        return None  # 纯 content 且被暂存 → 整条跳过
+    except Exception:
+        return sse_line
 
 
 async def gemini_fake_stream_generator(
@@ -637,7 +708,9 @@ async def execute_gemini_call(
                             config=gen_config_dict
                         )
 
-                        # 预填充智能兼容：把预填充文本作为回复开头先发出（仅一次）
+                        # 预填充智能兼容：把预填充文本作为回复开头先发出（仅一次）；
+                        # 同时启用流式去重器，模型若复述预填充开头会被自动裁掉（n>1 时不启用）。
+                        deduper = PrefillDeduper(prefill_text) if (prefill_text and (request_obj.n or 1) == 1) else None
                         if prefill_text and not has_yielded:
                             has_yielded = True
                             _pf = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}]}
@@ -656,7 +729,19 @@ async def execute_gemini_call(
                             num_candidates = len(chunk_item_call.candidates) if getattr(chunk_item_call, "candidates", None) else 1
                             for ci in range(num_candidates):
                                 has_yielded = True
-                                yield convert_chunk_to_openai(chunk_item_call, request_obj.model, response_id_for_stream, ci)
+                                sse_chunk = convert_chunk_to_openai(chunk_item_call, request_obj.model, response_id_for_stream, ci)
+                                if deduper is not None:
+                                    sse_chunk = _dedup_sse_chunk_content(sse_chunk, deduper)
+                                    if sse_chunk is None:
+                                        continue  # 正文暂存于去重器，跳过空 chunk
+                                yield sse_chunk
+
+                        # 去重器可能还攒着开头文本（上游没发 finish chunk 的场景）
+                        if deduper is not None and not deduper.done:
+                            tail = deduper.flush()
+                            if tail:
+                                _tail = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}]}
+                                yield f"data: {json.dumps(_tail, ensure_ascii=False)}\n\n"
 
                         if final_p_tk > 0 or final_c_tk > 0:
                             print(f"💰 [算力消耗统计] 提示词: {final_p_tk} | 思考与生成: {final_c_tk} | 总计: {final_t_tk} Tokens")
