@@ -36,6 +36,11 @@ class ProxyStats:
         with self.lock:
             self.retry_counts += 1
 
+    def add_success(self):
+        """直接计一次成功请求（Cookie 通道不产生 token 统计行，成功数单独计入）。"""
+        with self.lock:
+            self.success_requests += 1
+
     def add_tokens(self, p_tokens, c_tokens):
         with self.lock:
             self.prompt_tokens += p_tokens

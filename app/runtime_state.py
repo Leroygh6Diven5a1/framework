@@ -98,7 +98,7 @@ class AppState:
             current = state.get("settings")
             current = dict(current) if isinstance(current, dict) else {}
             for k, v in patch.items():
-                if k in app_config.DEFAULT_SETTINGS:
+                if k in app_config.DEFAULT_SETTINGS and k != "model_overrides":
                     current[k] = v
             state["settings"] = current
             self._save_state(state)
@@ -106,6 +106,71 @@ class AppState:
             merged.update(current)
             print(f"🔧 [状态管理器] 已更新 {len(patch)} 项运行时设置。")
             return merged
+
+    # ========== 按模型参数覆盖（per-model overrides） ==========
+
+    def _get_overrides_map(self, state: dict) -> dict:
+        stored = state.get("settings")
+        if isinstance(stored, dict) and isinstance(stored.get("model_overrides"), dict):
+            return dict(stored["model_overrides"])
+        return {}
+
+    def get_model_overrides(self) -> dict:
+        """返回全部按模型覆盖映射：{ 模型ID: {键: 值} }。"""
+        with self._lock:
+            return self._get_overrides_map(self._load_state())
+
+    def set_model_override(self, model_name: str, patch: dict) -> dict:
+        """为某模型保存专属参数（仅接受 PER_MODEL_KEYS 中的键）。返回该模型的最新专属值。"""
+        model_name = (model_name or "").strip()
+        if not model_name or not isinstance(patch, dict):
+            return {}
+        clean = {k: v for k, v in patch.items() if k in app_config.PER_MODEL_KEYS}
+        with self._lock:
+            state = self._load_state()
+            settings = state.get("settings")
+            settings = dict(settings) if isinstance(settings, dict) else {}
+            overrides = settings.get("model_overrides")
+            overrides = dict(overrides) if isinstance(overrides, dict) else {}
+            overrides[model_name] = clean
+            settings["model_overrides"] = overrides
+            state["settings"] = settings
+            self._save_state(state)
+            print(f"🔧 [状态管理器] 已保存模型 {model_name} 的专属参数（{len(clean)} 项）。")
+            return clean
+
+    def clear_model_override(self, model_name: str) -> bool:
+        """清除某模型的专属参数，回退到全局默认。"""
+        model_name = (model_name or "").strip()
+        with self._lock:
+            state = self._load_state()
+            settings = state.get("settings")
+            if not isinstance(settings, dict):
+                return False
+            overrides = settings.get("model_overrides")
+            if not isinstance(overrides, dict) or model_name not in overrides:
+                return False
+            overrides.pop(model_name, None)
+            settings["model_overrides"] = overrides
+            state["settings"] = settings
+            self._save_state(state)
+            print(f"🔧 [状态管理器] 已清除模型 {model_name} 的专属参数。")
+            return True
+
+    def get_effective_settings(self, model_name: str) -> dict:
+        """返回“该模型生效的设置”：全局默认叠加该模型专属覆盖（覆盖仅限 PER_MODEL_KEYS）。
+
+        用于参数构建：调用方无需感知覆盖逻辑，拿到的字典里
+        thinking_g3_level/image_size/default_temperature 等已是该模型的最终值。
+        """
+        base = self.get_settings()
+        overrides = base.get("model_overrides") or {}
+        ov = overrides.get((model_name or "").strip())
+        if isinstance(ov, dict):
+            for k in app_config.PER_MODEL_KEYS:
+                if k in ov:
+                    base[k] = ov[k]
+        return base
 
 
 # 单例模式导出

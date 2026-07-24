@@ -79,4 +79,37 @@ DEFAULT_SETTINGS = {
     "safety_score": SAFETY_SCORE,
     # 预填充兼容模式: smart|minimal|off
     "prefill_mode": "smart",
+    # 预填充触发时压制原生思考（“卡思维链”核心开关）：
+    # 3.x 压到最低档（minimal/低于则 low）并关闭思考回传；2.5-flash 预算设 0 全关、2.5-pro 降到最低 128。
+    # 此路径会忽略前端 effort（预填充时优先）。
+    "prefill_suppress_thinking": True,
+    # 原生思考控制（酒馆预设“卡原生思维链”核心）：
+    #   request = 跟随前端 reasoning_effort（默认）
+    #   off     = 关闭原生思考：压到该模型最低档 + 忽略前端 effort + 不回传思考
+    #             （Studio/batchGraphql 忽略 includeThoughts，故 Cookie 通道会在响应侧剥离思考块）
+    #   console = 忽略前端 effort，强制用控制台/该模型专属档位
+    "native_thinking_mode": "request",
+    # —— 以下两个为上一版布尔开关，保留仅作向后兼容（新 UI 用 native_thinking_mode）——
+    "thinking_force_console": False,
+    "hide_thoughts": False,
+    # smart 模式续写指令模板（留空=用内置默认；预填充文本会自动附在模板之后）
+    "prefill_instruction": "",
+    # Cookie 通道调试：打印出站 generationConfig（无正文时的原始响应样本总是自动记录，无需开启）
+    "cookie_debug": False,
+    # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
+    # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
+    "model_overrides": {},
 }
+
+# 允许按模型单独保存（覆盖全局默认）的参数键。
+# 其余为基础设施级（图压缩/重试/假流式/预填充/安全分/调试等），保持全局唯一。
+PER_MODEL_KEYS = [
+    "native_thinking_mode",
+    "thinking_g3_level",
+    "thinking_g25_budget",
+    "image_size",
+    "image_aspect_ratio",
+    "default_temperature",
+    "default_top_p",
+    "default_max_tokens",
+]

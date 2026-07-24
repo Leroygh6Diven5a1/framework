@@ -163,53 +163,124 @@ def _is_empty_message(msg: OpenAIMessage) -> bool:
     return not _message_text(msg.content).strip()
 
 
-def apply_prefill_compat(messages: List[OpenAIMessage], mode: str = "smart") -> Tuple[List[OpenAIMessage], str]:
+DEFAULT_PREFILL_INSTRUCTION = (
+    "[继续输出] 下面是你这条回复已经写好的开头，请从断点处无缝继续，"
+    "不要重复开头内容，也不要添加任何前言、解释或标注："
+)
+
+
+def apply_prefill_compat(
+    messages: List[OpenAIMessage],
+    mode: str = "smart",
+    allow_model_last: bool = False,
+    instruction_template: str = "",
+) -> Tuple[List[OpenAIMessage], str, bool]:
     """
     预填充(prefill)兼容：Gemini 3.x 拒绝以 assistant/model 结尾的请求（400）。
 
     - mode="off"：不处理（可能 400）。
     - mode="minimal"：末尾非 user 时追加一个占位 user，仅保证不报错（不还原预填充）。
-    - mode="smart"：把末尾 assistant 预填充取出，转成末尾 user 的“续写指令”，
-      并返回 prefill 文本，由上游把它拼回输出开头 → 最忠实还原 roleplay 预填充。
+    - mode="smart"：
+      * allow_model_last=True（模型允许以 model 轮次结尾，如 2.5 及更早）→ **原生透传**：
+        消息保持原样发给上游，模型直接续写末尾轮次，最忠实；
+      * 否则（3.x 等）→ 把末尾 assistant 预填充取出，转成末尾 user 的“续写指令”
+        （模板可用 instruction_template 自定义，留空用内置默认）。
+      两种情况都返回 prefill 文本，由上游把它拼回输出开头（配合去重）。
 
-    返回 (处理后的消息列表, 需拼回输出开头的预填充文本)。
-    与模型名无关：仅按请求形状触发；新加模型 ID 自动生效。
+    返回 (处理后的消息列表, 需拼回输出开头的预填充文本, 是否检测到预填充)。
+    第三项供“预填充时压制原生思考”等联动逻辑使用。
+    与模型名无关：按请求形状 + 能力档案触发；新加模型 ID 自动生效。
     """
     if not messages or mode == "off":
-        return messages, ""
+        return messages, "", False
 
     # 找到最后一条“非空”消息
     idx = len(messages) - 1
     while idx >= 0 and _is_empty_message(messages[idx]):
         idx -= 1
     if idx < 0:
-        return messages, ""
+        return messages, "", False
 
     last = messages[idx]
     if last.role != "assistant" or getattr(last, "tool_calls", None):
-        return messages, ""  # 已是 user 结尾 / 末尾是工具调用 → 无需处理
+        return messages, "", False  # 已是 user 结尾 / 末尾是工具调用 → 无需处理
 
     prefill = _message_text(last.content).strip()
     if not prefill:
-        return messages, ""
+        return messages, "", False
 
     if mode == "minimal":
         new_msgs = list(messages)
         new_msgs.append(OpenAIMessage(role="user", content="(请继续)"))
-        return new_msgs, ""
+        return new_msgs, "", True
+
+    # smart + 模型支持 model 结尾 → 原生预填充透传（不改消息，模型直接续写）
+    if allow_model_last:
+        return messages, prefill, True
 
     # smart：丢弃末尾预填充 assistant（及其后的空消息），转成续写指令
     new_msgs = list(messages[:idx])
-    instruction = (
-        "[继续输出] 下面是你这条回复已经写好的开头，请从断点处无缝继续，"
-        "不要重复开头内容，也不要添加任何前言、解释或标注：\n\n" + prefill
-    )
+    intro = (instruction_template or "").strip() or DEFAULT_PREFILL_INSTRUCTION
+    instruction = intro + "\n\n" + prefill
     if new_msgs and new_msgs[-1].role == "user" and isinstance(new_msgs[-1].content, str):
         merged = new_msgs[-1].content + "\n\n" + instruction
         new_msgs[-1] = OpenAIMessage(role="user", content=merged)
     else:
         new_msgs.append(OpenAIMessage(role="user", content=instruction))
-    return new_msgs, prefill
+    return new_msgs, prefill, True
+
+
+def strip_prefill_overlap(prefill: str, output: str, min_overlap: int = 8) -> str:
+    """预填充去重：若模型无视指令、把预填充的结尾复述在输出开头，裁掉重叠部分。
+
+    - 输出以整段预填充开头（完整复述）→ 裁掉整段；
+    - 否则找 预填充结尾 与 输出开头 的最长重叠（≥ min_overlap 字符，避免误伤）。
+    """
+    if not prefill or not output:
+        return output
+    if output.startswith(prefill):
+        return output[len(prefill):]
+    kmax = min(len(prefill), len(output))
+    for k in range(kmax, min_overlap - 1, -1):
+        if prefill[-k:] == output[:k]:
+            return output[k:]
+    return output
+
+
+class PrefillDeduper:
+    """流式版预填充去重器。
+
+    预填充文本由代理先行发给客户端；若模型复述了预填充开头，需要在
+    流式输出的起始处裁掉重叠。做法：先攒下输出开头的一小段（窗口 =
+    min(len(prefill)+32, 600) 字符），做一次去重判定后放行，之后的
+    文本原样透传（不再增加任何延迟）。
+
+    用法：out = deduper.feed(chunk_text)（可能返回空串表示还在攒）；
+    流结束时调用 deduper.flush() 取回剩余文本。
+    """
+
+    def __init__(self, prefill: str, window_cap: int = 600):
+        self.prefill = prefill or ""
+        self.window = min(len(self.prefill) + 32, window_cap) if self.prefill else 0
+        self.buffer = ""
+        self.done = self.window == 0
+
+    def feed(self, text: str) -> str:
+        if self.done:
+            return text
+        self.buffer += text
+        if len(self.buffer) < self.window:
+            return ""
+        return self._resolve()
+
+    def flush(self) -> str:
+        if self.done:
+            return ""
+        return self._resolve()
+
+    def _resolve(self) -> str:
+        out, self.buffer, self.done = self.buffer, "", True
+        return strip_prefill_overlap(self.prefill, out)
 
 
 def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:

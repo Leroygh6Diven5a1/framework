@@ -217,7 +217,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="w-36 h-36"><canvas id="donut"></canvas></div>
       </div>
       <div class="card p-5 md:col-span-2">
-        <div class="lbl mb-4">Token 算力消耗</div>
+        <div class="lbl mb-4">Token 算力消耗 <span class="text-neutral-400" style="text-transform:none;font-weight:400">· 仅标准 Express 通道计入（Cookie 直连接口不回传用量）</span></div>
         <div class="space-y-4">
           <div><div class="flex justify-between text-sm mb-1"><span class="text-neutral-600">Prompt（输入）</span><span id="t-prompt" class="val font-semibold">0</span></div><div class="w-full bg-neutral-100 rounded-full h-1.5"><div class="bg-black h-1.5 rounded-full" style="width:70%"></div></div></div>
           <div><div class="flex justify-between text-sm mb-1"><span class="text-neutral-600">Completion（输出）</span><span id="t-comp" class="val font-semibold">0</span></div><div class="w-full bg-neutral-100 rounded-full h-1.5"><div class="bg-neutral-400 h-1.5 rounded-full" style="width:45%"></div></div></div>
@@ -260,12 +260,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="card p-5 mb-4">
       <div class="flex items-center justify-between flex-wrap gap-3">
         <div>
-          <div class="lbl mb-1">按模型查看支持情况</div>
+          <div class="lbl mb-1">选择模型 <span id="ov-badge" class="pill pill-accent hidden" style="text-transform:none">已有专属参数</span></div>
           <select id="model-sel" class="inp" style="min-width:240px" onchange="renderCaps()"></select>
         </div>
         <div id="caps-summary" class="text-xs text-neutral-600 flex flex-wrap gap-2 max-w-xl"></div>
       </div>
-      <p class="text-xs text-neutral-500 mt-3">下方为<b>全局默认值</b>，按模型家族自动生效；单次请求参数（或模型名后缀）可覆盖。选择模型仅用于查看其支持的参数并给出提示。</p>
+      <p class="text-xs text-neutral-500 mt-3">下方参数默认为<b>全局默认值</b>（对所有模型生效）。可为<b>当前所选模型</b>单独保存专属值：<b>思考、生图、采样默认</b>这三类支持按模型覆盖。优先级：<b>单次请求 &gt; 模型专属 &gt; 全局默认 &gt; 内置</b>，最后仍按模型能力自动裁剪。</p>
+      <div class="flex items-center gap-2 mt-3 flex-wrap">
+        <button class="btn px-4 py-2 text-sm" onclick="saveModelOverride()">💾 保存为该模型专属</button>
+        <button class="px-4 py-2 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="clearModelOverride()">清除该模型专属</button>
+        <span id="ov-hint" class="text-xs text-neutral-500"></span>
+      </div>
     </div>
 
     <div class="grid md:grid-cols-2 gap-4">
@@ -281,6 +286,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <input id="thinking_g25_budget" type="number" class="inp" placeholder="-1">
         </div>
         <p id="think-note" class="text-xs text-neutral-500 mt-2"></p>
+        <div class="mt-3 pt-3 border-t border-neutral-100">
+          <div class="lbl mb-1">原生思考控制（native_thinking_mode）</div>
+          <select id="native_thinking_mode" class="inp">
+            <option value="request">跟随请求（默认）</option>
+            <option value="off">关闭原生思考（角色扮演推荐）</option>
+            <option value="console">强制用上方档位（忽略前端）</option>
+          </select>
+          <p class="text-xs text-neutral-500 mt-2 leading-relaxed">🎭 <b>酒馆预设"卡原生思维链"选“关闭原生思考”即可（可用“保存为该模型专属”只对 3.6-flash 生效）。</b><br>• <b>跟随请求</b>：用前端发来的 <code>reasoning_effort</code>；SillyTavern 常发 <code>xhigh</code> → 高强度原生思考。<br>• <b>关闭原生思考</b>：忽略前端参数，把档位压到该模型最低（3.x=minimal、2.5-flash 预算 0），并<b>不返回思考</b>。⚠️ 实测 Studio(batchGraphql) 会忽略 includeThoughts，故本项会在<b>压到 minimal</b> 的同时于响应侧<b>剥离思考块</b>——这也是重预设下 3.6-flash 能出正文（不被思考阶段截断）的关键。<br>• <b>强制用上方档位</b>：忽略前端，用你在上面选的档位（返回思考）。<br>（预填充预设另见"开关 &amp; 预填充"卡片的压制开关。）</p>
+        </div>
       </div>
 
       <!-- 生图 -->
@@ -338,15 +352,23 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="flex items-center justify-between"><span class="text-sm">假流式心跳间隔(秒)</span><input id="fake_streaming_interval" type="number" step="0.5" class="inp" style="width:90px"></div>
           <div class="flex items-center justify-between"><span class="text-sm">多 Key 轮询（round-robin）</span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
           <div class="flex items-center justify-between"><span class="text-sm">输出附加安全分</span><label class="switch"><input type="checkbox" id="safety_score"><span class="slider"></span></label></div>
+          <div class="flex items-center justify-between"><span class="text-sm">Cookie 通道调试日志 <span class="text-xs text-neutral-400">（打印出站参数；无正文诊断总是自动记录）</span></span><label class="switch"><input type="checkbox" id="cookie_debug"><span class="slider"></span></label></div>
           <div class="flex items-center justify-between gap-3"><span class="text-sm">预填充兼容模式</span>
             <select id="prefill_mode" class="inp" style="width:130px"><option value="smart">智能</option><option value="minimal">最小</option><option value="off">关闭</option></select>
           </div>
+          <div class="flex items-center justify-between"><span class="text-sm">预填充时压制原生思考 <span class="text-xs text-neutral-400">（卡思维链）</span></span><label class="switch"><input type="checkbox" id="prefill_suppress_thinking"><span class="slider"></span></label></div>
+          <div>
+            <div class="lbl mb-1">续写指令模板（留空=内置默认；预填充文本自动附在其后）</div>
+            <textarea id="prefill_instruction" rows="2" class="inp log" placeholder="[继续输出] 下面是你这条回复已经写好的开头，请从断点处无缝继续，不要重复开头内容，也不要添加任何前言、解释或标注："></textarea>
+          </div>
+          <p class="text-xs text-neutral-500 leading-relaxed">智能模式：2.5 及更早模型<b>原生透传</b>预填充（模型直接续写）；3.x 拒绝 model 结尾，自动转为末尾 user 续写指令。两者都会把预填充拼回输出开头并自动去重。压制思考时：3.x 压至最低档并不回传思考（无法全关），2.5-flash 预算 0 全关、2.5-pro 降至 128。<b>注意：预填充压制仅在请求真的带预填充时触发；若你的酒馆预设把思维链写在 system 提示里（无预填充），请改用上方“思考强度”卡片的“强制用此设置”。</b></p>
         </div>
       </div>
     </div>
 
-    <div class="flex justify-end mt-4">
-      <button class="btn px-5 py-2.5 text-sm" onclick="saveSettings()">保存设置</button>
+    <div class="flex items-center justify-end gap-3 mt-4">
+      <span class="text-xs text-neutral-500">此按钮保存<b>全局默认 + 基础设施项</b>，不影响已设专属参数的模型</span>
+      <button class="btn px-5 py-2.5 text-sm" onclick="saveSettings()">保存全局设置</button>
     </div>
   </section>
 
@@ -366,6 +388,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script>
 const $ = id => document.getElementById(id);
 let CAPS = {}, chart = null, curAR = "";
+let GLOBAL_SETTINGS = {}, OVERRIDES = {};
+const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens'];
 const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1800); }
@@ -431,20 +455,72 @@ async function loadRuntime(){
 }
 
 /* ---------- Params ---------- */
+function setV(id,v){ const el=$(id); if(!el) return; if(el.type==='checkbox') el.checked=!!v; else el.value=(v===null||v===undefined)?'':v; }
 async function loadParams(){
   try{
     const s=await (await fetch('/api/settings')).json();
+    GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    const setV=(id,v)=>{ const el=$(id); if(!el) return; if(el.type==='checkbox') el.checked=!!v; else el.value=(v===null||v===undefined)?'':v; };
-    ['thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score'].forEach(k=>setV(k,s[k]));
+    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','prefill_suppress_thinking'].forEach(k=>setV(k,s[k]));
+    // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
+    if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
+      if(s.hide_thoughts) setV('native_thinking_mode','off');
+      else if(s.thinking_force_console) setV('native_thinking_mode','console');
+    }
   }catch(e){}
   try{
     const c=await (await fetch('/api/capabilities')).json();
     CAPS=c.capabilities||{};
-    $('model-sel').innerHTML=(c.models||[]).map(m=>`<option value="${m}">${m}</option>`).join('');
+    OVERRIDES=c.overrides||{};
+    $('model-sel').innerHTML=(c.models||[]).map(m=>{const star=OVERRIDES[m]?' ★':''; return `<option value="${m}">${m}${star}</option>`;}).join('');
     renderCaps();
   }catch(e){}
+}
+// 按所选模型把“可覆盖的 7 个参数字段”填成：有专属值用专属，否则回退全局
+function applyModelParamFields(model){
+  const ov = OVERRIDES[model] || {};
+  PER_MODEL_KEYS.forEach(k=>{
+    const v = (k in ov) ? ov[k] : GLOBAL_SETTINGS[k];
+    if(k==='image_aspect_ratio'){ curAR = v || ""; }
+    else setV(k, v);
+  });
+  const has = !!OVERRIDES[model] && Object.keys(OVERRIDES[model]).length>0;
+  $('ov-badge').classList.toggle('hidden', !has);
+  $('ov-hint').textContent = has ? '当前显示该模型的专属值（带 ★）；改动后点“保存为该模型专属”更新。' : '当前显示全局默认值；改动后点“保存为该模型专属”即可只对此模型生效。';
+}
+async function saveModelOverride(){
+  const m=$('model-sel').value; if(!m) return;
+  const patch={
+    native_thinking_mode:$('native_thinking_mode').value,
+    thinking_g3_level:$('thinking_g3_level').value,
+    thinking_g25_budget:numOr('thinking_g25_budget',-1),
+    image_size:$('image_size').value,
+    image_aspect_ratio:$('image_aspect_ratio').value,
+    default_temperature:numOrNull('default_temperature'),
+    default_top_p:numOrNull('default_top_p'),
+    default_max_tokens:numOrNull('default_max_tokens'),
+  };
+  try{
+    const r=await fetch('/api/model-overrides/'+encodeURIComponent(m),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
+    const d=await r.json();
+    if(r.ok){ OVERRIDES[m]=d.override||patch; toast('已保存 '+m+' 专属参数'); refreshModelSelStars(); applyModelParamFields(m); }
+    else toast('保存失败');
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+async function clearModelOverride(){
+  const m=$('model-sel').value; if(!m) return;
+  if(!OVERRIDES[m]){ toast('该模型没有专属参数'); return; }
+  try{
+    const r=await fetch('/api/model-overrides/'+encodeURIComponent(m),{method:'DELETE'});
+    if(r.ok){ delete OVERRIDES[m]; toast('已清除 '+m+' 专属参数，回退全局'); refreshModelSelStars(); applyModelParamFields(m); }
+    else toast('清除失败');
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+function refreshModelSelStars(){
+  const sel=$('model-sel'); const cur=sel.value;
+  [...sel.options].forEach(o=>{ const base=o.value; o.textContent = base + (OVERRIDES[base]?' ★':''); });
+  sel.value=cur;
 }
 function chip(t, accent){ return `<span class="pill${accent?' pill-accent':''}">${t}</span>`; }
 function fillARFor(cap){
@@ -455,6 +531,7 @@ function fillARFor(cap){
 }
 function renderCaps(){
   const m=$('model-sel').value; const cap=CAPS[m]; if(!cap) return;
+  applyModelParamFields(m);   // 按模型填入专属/全局参数值（含 curAR）
   const th=cap.thinking||{};
   let sum=[chip('家族 '+cap.family, true)];
   if(th.kind==='level') sum.push(chip('思考档位 '+(th.levels||[]).join(' / ')));
@@ -501,14 +578,8 @@ function renderCaps(){
 function numOrNull(id){ const v=$(id).value.trim(); return v===''?null:Number(v); }
 function numOr(id,d){ const v=$(id).value.trim(); return v===''?d:Number(v); }
 async function saveSettings(){
+  // 基础设施级设置：始终作为全局保存
   const patch={
-    thinking_g3_level:$('thinking_g3_level').value,
-    thinking_g25_budget:numOr('thinking_g25_budget',-1),
-    image_size:$('image_size').value,
-    image_aspect_ratio:$('image_aspect_ratio').value,
-    default_temperature:numOrNull('default_temperature'),
-    default_top_p:numOrNull('default_top_p'),
-    default_max_tokens:numOrNull('default_max_tokens'),
     img_compress_enabled:$('img_compress_enabled').checked,
     img_compress_max_dim:numOr('img_compress_max_dim',1536),
     img_compress_max_mb:numOr('img_compress_max_mb',1.5),
@@ -519,11 +590,35 @@ async function saveSettings(){
     fake_streaming_interval:numOr('fake_streaming_interval',1),
     roundrobin:$('roundrobin').checked,
     safety_score:$('safety_score').checked,
+    cookie_debug:$('cookie_debug').checked,
     prefill_mode:$('prefill_mode').value,
+    prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
+    prefill_instruction:$('prefill_instruction').value,
   };
+  // 7 个可覆盖参数：仅当所选模型“没有专属配置”时，才作为全局默认保存，
+  // 避免把某模型的专属值误存成全局（专属值请用“保存为该模型专属”）。
+  const m=$('model-sel').value;
+  const overriding = !!(OVERRIDES[m] && Object.keys(OVERRIDES[m]).length>0);
+  if(!overriding){
+    Object.assign(patch,{
+      native_thinking_mode:$('native_thinking_mode').value,
+      thinking_g3_level:$('thinking_g3_level').value,
+      thinking_g25_budget:numOr('thinking_g25_budget',-1),
+      image_size:$('image_size').value,
+      image_aspect_ratio:$('image_aspect_ratio').value,
+      default_temperature:numOrNull('default_temperature'),
+      default_top_p:numOrNull('default_top_p'),
+      default_max_tokens:numOrNull('default_max_tokens'),
+    });
+  }
+  const scope = overriding
+    ? '将保存全局的基础设施项（图压缩/重试/假流式/预填充/思考控制开关等）。\n当前所选模型有专属思考/生图/采样参数，不会被改动。'
+    : '将保存为全局默认，影响所有【未设置专属参数】的模型。\n已设专属参数的模型不受影响。';
+  if(!confirm(scope + '\n\n确定保存全局设置吗？')) return;
   try{
     const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
-    toast(r.ok?'设置已保存':'保存失败');
+    if(r.ok){ GLOBAL_SETTINGS=await r.json(); toast(overriding?'已保存全局(基础设施)设置；该模型的思考/生图/采样为专属值，未改全局':'全局设置已保存'); }
+    else toast('保存失败');
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 
@@ -634,7 +729,35 @@ async def get_capabilities_api(_auth: bool = Depends(require_auth)):
     except Exception:
         models = []
     caps = {m: mc.capabilities_summary(m) for m in models}
-    return JSONResponse(content={"models": models, "capabilities": caps})
+    # 附带各模型是否已有专属参数覆盖，供前端标示
+    overrides = app_state.get_model_overrides()
+    return JSONResponse(content={"models": models, "capabilities": caps, "overrides": overrides})
+
+
+# ==========================================
+# 按模型参数覆盖（per-model overrides）
+# ==========================================
+@app.get("/api/model-overrides")
+async def list_model_overrides(_auth: bool = Depends(require_auth)):
+    return JSONResponse(content=app_state.get_model_overrides())
+
+
+@app.post("/api/model-overrides/{model_name}")
+async def save_model_override(model_name: str, request: Request, _auth: bool = Depends(require_auth)):
+    try:
+        patch = await request.json()
+    except Exception:
+        patch = {}
+    if not isinstance(patch, dict):
+        return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON 对象。"})
+    saved = app_state.set_model_override(model_name, patch)
+    return JSONResponse(content={"status": "success", "model": model_name, "override": saved})
+
+
+@app.delete("/api/model-overrides/{model_name}")
+async def delete_model_override(model_name: str, _auth: bool = Depends(require_auth)):
+    ok = app_state.clear_model_override(model_name)
+    return JSONResponse(content={"status": "success" if ok else "not_found", "model": model_name})
 
 
 class CookieSetting(BaseModel):
