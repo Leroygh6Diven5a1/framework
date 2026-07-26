@@ -70,6 +70,8 @@ DEFAULT_SETTINGS = {
     "img_compress_max_mb": 1.5,
     "img_compress_quality": 85,
     # 重试
+    # 语义：retry_max = 失败后的**重试**次数，总请求次数 = retry_max + 1。
+    # 两条通道统一走 api_helpers.get_retry_settings() 读取（会钳位到 0–50）。
     "retry_max": 10,
     "retry_backoff_seconds": 5,
     # 开关（初始值取环境变量）
@@ -78,6 +80,15 @@ DEFAULT_SETTINGS = {
     "roundrobin": ROUNDROBIN,
     "safety_score": SAFETY_SCORE,
     # 预填充兼容模式: smart|minimal|off
+    # 默认 smart。两种模式的优劣**取决于预填充的结尾形态**，用真实酒馆预设
+    # （Izumi，思维链标签 <konatan_planning~>，西语思考）实测 gemini-3.6-flash × 3：
+    #   smart      重复开标签 0/3，思考语言正确 3/3   ← 真实预设的常见形态
+    #   keep_turn  重复开标签 3/3，思考语言正确 2/3
+    # 真实预设的预填充多以完整句子收尾（"…¡Allá voy!"），keep_turn 追加的 user
+    # 推动语会让模型当成新一轮，把开标签又写一遍；而该重复**去重逻辑抓不到**
+    # （预填充结尾与输出开头无重叠），最终输出里出现两个开标签，破坏前端正则。
+    # 仅当预填充停在半截 token（如 "<thinking>\n1."）时 keep_turn 才更优——
+    # 那种情况下 smart 会跑题且丢格式（合成用例实测 0/3）。
     "prefill_mode": "smart",
     # 预填充触发时压制原生思考（“卡思维链”核心开关）：
     # 3.x 压到最低档（minimal/低于则 low）并关闭思考回传；2.5-flash 预算设 0 全关、2.5-pro 降到最低 128。
@@ -94,8 +105,25 @@ DEFAULT_SETTINGS = {
     "hide_thoughts": False,
     # smart 模式续写指令模板（留空=用内置默认；预填充文本会自动附在模板之后）
     "prefill_instruction": "",
-    # Cookie 通道调试：打印出站 generationConfig（无正文时的原始响应样本总是自动记录，无需开启）
+    # 出站参数调试：打印两条通道实际发出的 generationConfig / thinkingConfig。
+    # 实机验证思考档位、采样裁剪是否生效时必开。
+    # （旧键名 cookie_debug 保留为别名，只作用于 Cookie 通道的额外诊断）
+    "debug_outbound": False,
     "cookie_debug": False,
+    # 思考签名内嵌开关（默认关）：
+    #   关 = 生成短 tool_call_id，签名存进进程内旁路缓存（推荐，避免被前端截断）
+    #   开 = 退回旧的 `{id}__thought__{base64}` 内嵌格式，供多进程/多副本部署使用
+    # 生图请求是否下发 system_instruction（默认关，保持既有行为）。
+    # 官方未禁止生图模型使用系统指令，但旧代码一直剥离；打开前请先真机验证目标模型。
+    "image_system_instruction": False,
+    # 轻量前端（RikkaHub 等）注入：留空 = 不启用，酒馆用户不受影响。
+    # 这两项解决的是"前端本身没有预设系统"的场景，见 message_processing.apply_console_injection。
+    "inject_system_instruction": "",
+    "inject_prefill": "",
+    # 生图模型是否也注入预填充。实测预填充对生图有很强的引导力
+    # （同一句"画一只猫"：无预填充→彩色写实照片；预填充承诺"纯黑白钢笔线稿"→真的输出线稿），
+    # 但角色扮演用的预填充落到生图请求上会让模型改吐文本，故默认关、按需开。
+    "inject_prefill_for_image": False,
     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
     # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
     "model_overrides": {},
@@ -112,4 +140,7 @@ PER_MODEL_KEYS = [
     "default_temperature",
     "default_top_p",
     "default_max_tokens",
+    # 注入项按模型区分很常见：只给跑角色扮演的模型开，问答模型保持干净。
+    "inject_system_instruction",
+    "inject_prefill",
 ]

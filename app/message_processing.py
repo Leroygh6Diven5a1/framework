@@ -2,15 +2,18 @@ import base64
 import re
 import json
 import time
+import uuid
 import random 
 import httpx
 import concurrent.futures
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 import config as app_config
+import model_capabilities as mc
 from runtime_state import app_state
+from signature_store import signature_store, SKIP_VALIDATOR_SENTINEL
 
 from google.genai import types
-from models import OpenAIMessage, ContentPartText, ContentPartImage
+from models import OpenAIMessage, ContentPartText, ContentPartImage, normalize_content_part
 
 import io
 try:
@@ -79,6 +82,96 @@ def optimize_image_bytes(image_data: bytes, original_mime: str, max_size_bytes: 
 
 SUPPORTED_ROLES = ["user", "model", "function"] 
 
+# ============================================================
+# 思考签名（thought signature）的出入站处理（P0-4）
+#
+# 官方约束（核对于 2026-07-26）：
+#   - 函数调用强校验，Gemini 3 缺签名直接 400；纯文本不强校验但会掉质量。
+#   - Gemini 3 的签名总在**第一个** function call part 上，必须原样回传。
+#   - 并行调用必须按 FC1,FC2,FR1,FR2 顺序回传，交错会 400。
+#   - 拿不到签名时可用 skip_thought_signature_validator 哨兵跳过校验（最后手段）。
+#
+# 这里的两个函数是出/入站的唯一入口。此前 api_helpers 与本文件各有一份复制粘贴的
+# 实现，且已经出现细微不一致（一个用 response_id、一个用 base_id 拼 fallback id）。
+# ============================================================
+
+LEGACY_THOUGHT_SEP = "__thought__"
+
+
+def _signature_bytes(part: Any, fc: Any) -> Optional[bytes]:
+    """从 part / function_call 上取出思考签名，统一成 bytes。"""
+    sig = getattr(part, "thought_signature", None)
+    if sig is None:
+        sig = getattr(fc, "thought_signature", None)
+    if isinstance(sig, bytes):
+        return sig or None
+    if isinstance(sig, str) and sig:
+        try:
+            return base64.b64decode(sig)
+        except Exception:
+            return sig.encode("utf-8")
+    return None
+
+
+def build_tool_call_id(fc: Any, part: Any) -> str:
+    """生成 OpenAI 侧的 tool_call_id，并把思考签名登记进旁路缓存。
+
+    返回**短 id**（≤40 字符）。旧实现把 base64 签名拼进 id，动辄上千字符，
+    很多前端会截断，回传时签名丢失 → 400。
+
+    注意：这里只是不再**生成**旧的内嵌格式，`resolve_tool_call_signature` 仍然
+    **解析**它——升级前发出的 id 可能还留在客户端的对话历史里。
+    """
+    real_id = getattr(fc, "id", None) or ""
+    if not isinstance(real_id, str):
+        real_id = str(real_id)
+    if not real_id:
+        real_id = "call_" + uuid.uuid4().hex[:16]   # 共 21 字符
+
+    sig = _signature_bytes(part, fc)
+    if sig:
+        signature_store.put(real_id, sig)
+    return real_id
+
+
+def resolve_tool_call_signature(tool_call_id: str,
+                                require_signature: bool = False) -> Tuple[str, Optional[bytes]]:
+    """从客户端回传的 tool_call_id 还原 (真实 id, 思考签名)。
+
+    三层降级：旁路缓存 → 旧的 `__thought__` 内嵌格式 → 官方哨兵值。
+    require_signature=True（Gemini 3.x）时绝不返回 None，避免整个请求 400。
+    """
+    real_id = tool_call_id or ""
+    sig: Optional[bytes] = None
+
+    if LEGACY_THOUGHT_SEP in real_id:
+        real_id, _, encoded = real_id.partition(LEGACY_THOUGHT_SEP)
+        try:
+            sig = base64.b64decode(encoded) or None
+        except Exception:
+            sig = None
+
+    if sig is None:
+        sig = signature_store.get(real_id)
+
+    if sig is None and require_signature:
+        sig = SKIP_VALIDATOR_SENTINEL
+        print("⚠️ [工具调用] 未能恢复思考签名（可能被前端截断或服务已重启），"
+              "已使用官方跳过校验哨兵。请求不会失败，但模型表现会下降。")
+
+    return real_id, sig
+
+
+def _requires_signature(model_name: str) -> bool:
+    """该模型是否强校验思考签名（仅 Gemini 3.x 家族）。"""
+    if not model_name:
+        return False
+    try:
+        return mc.get_profile(model_name)["family"] == "g3"
+    except Exception:
+        return False
+
+
 def extract_reasoning_by_tags(full_text: str, tag_name: str) -> Tuple[str, str]:
     if not tag_name or not isinstance(full_text, str):
         return "", full_text if isinstance(full_text, str) else ""
@@ -111,8 +204,11 @@ def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]
             except Exception as e:
                 print(f"⚠️ [图片处理] 提取 Markdown 图片失败，已跳过该图片：{e}")
         parts.reverse()
-    
-    remaining_text = re.sub(r"[ \t]+", " ", remaining_text).strip()
+        # 仅在**确实抽走了图片**时才压平空白：抠掉 data URL 会留下成片空格。
+        # 旧实现无条件执行，导致所有纯文本消息的缩进/多空格（代码块、ASCII 图、
+        # 酒馆预设的排版）都被悄悄改写。文本保真优先。
+        remaining_text = re.sub(r"[ \t]+", " ", remaining_text).strip()
+
     return parts, remaining_text
 
 def _coerce_tool_response(content: Any) -> Dict[str, Any]:
@@ -169,6 +265,89 @@ DEFAULT_PREFILL_INSTRUCTION = (
 )
 
 
+# keep_turn 模式用的收尾指令。预填充留在 model 轮次里，这里只需要一句极短的推动，
+# 越短越不干扰预设本身。
+DEFAULT_KEEP_TURN_NUDGE = (
+    "[继续] 从你上一条的断点处无缝往下写，不要重复已写内容，不要任何前言或解释。"
+)
+
+
+# 生图模型专用的续写指令。通用那句是"从断点处无缝往下写"，模型会照办——
+# 继续写**文本**，于是吐出一段字符画而不是图片（实测）。生图必须明确要图。
+DEFAULT_IMAGE_PREFILL_NUDGE = (
+    "[继续] 按上面说的风格与要求，直接输出图片本身，不要输出任何文字描述或字符画。"
+)
+
+
+def apply_console_injection(
+    messages: List[OpenAIMessage],
+    system_text: str = "",
+    prefill_text: str = "",
+    has_tools: bool = False,
+    is_image_model: bool = False,
+    allow_image_prefill: bool = False,
+) -> Tuple[List[OpenAIMessage], List[str]]:
+    """把控制台配置的 system 指令 / 预填充注入到消息里。
+
+    面向 RikkaHub 这类轻量前端：它们没有酒馆的预设系统，尤其**从不发送
+    assistant 预填充**，因此在这些前端下预填充这个杠杆完全用不上，
+    "预填充时压制原生思考"也永远不会触发。
+
+    注入发生在 `apply_prefill_compat` **之前**，注入完的消息与"前端自己发了
+    预填充"完全同形，下游四种兼容模式原样复用，不引入新分支。
+
+    四条护栏（缺一个就会和现有功能打架）：
+      1. 客户端已经发了预填充 → 不注入，否则两段预填充叠一起（酒馆场景）；
+      2. 请求带 tools → 不注入，凭空多一个 model 轮次会打乱函数调用往返；
+      3. 生图模型 → 默认不注入预填充，除非 allow_image_prefill=True。
+         预填充对生图确有很强的引导力（实测：同一句"画一只猫"，预填充承诺
+         "纯黑白钢笔线稿"就真的输出线稿，不加则是彩色写实照片），但角色扮演
+         用的预填充落到生图请求上会让模型改吐文本，所以做成开关而非默认放行；
+      4. 两个字段都留空 → 整个函数是空操作。
+
+    返回 (新消息列表, 说明做了什么的日志行列表)。
+    """
+    notes: List[str] = []
+    system_text = (system_text or "").strip()
+    prefill_text = (prefill_text or "").strip()
+    if not system_text and not prefill_text:
+        return messages, notes
+
+    new_msgs = list(messages or [])
+
+    if system_text:
+        # 追加在客户端 system 之后：越靠后越不容易被前面的内容淹没，
+        # 也保证前端自己的系统提示仍然在场。
+        insert_at = 0
+        for i, m in enumerate(new_msgs):
+            if m.role == "system":
+                insert_at = i + 1
+        new_msgs.insert(insert_at, OpenAIMessage(role="system", content=system_text))
+        notes.append(f"💉 [控制台注入] 已追加 system 指令（{len(system_text)} 字）。")
+
+    if prefill_text:
+        if has_tools:
+            notes.append("💉 [控制台注入] 请求带函数调用，已跳过预填充注入（避免打乱工具往返）。")
+        elif is_image_model and not allow_image_prefill:
+            notes.append("💉 [控制台注入] 生图模型，已跳过预填充注入"
+                         "（如需用预填充引导画风，请在控制台打开「生图也注入预填充」）。")
+        else:
+            idx = len(new_msgs) - 1
+            while idx >= 0 and _is_empty_message(new_msgs[idx]):
+                idx -= 1
+            client_has_prefill = (idx >= 0 and new_msgs[idx].role == "assistant"
+                                  and not getattr(new_msgs[idx], "tool_calls", None))
+            if client_has_prefill:
+                notes.append("💉 [控制台注入] 客户端已自带预填充，跳过注入（不覆盖前端预设）。")
+            else:
+                new_msgs = new_msgs[:idx + 1]
+                new_msgs.append(OpenAIMessage(role="assistant", content=prefill_text))
+                notes.append(f"💉 [控制台注入] 已注入预填充（{len(prefill_text)} 字），"
+                             "下面按预填充兼容模式处理。")
+
+    return new_msgs, notes
+
+
 def apply_prefill_compat(
     messages: List[OpenAIMessage],
     mode: str = "smart",
@@ -185,7 +364,16 @@ def apply_prefill_compat(
         消息保持原样发给上游，模型直接续写末尾轮次，最忠实；
       * 否则（3.x 等）→ 把末尾 assistant 预填充取出，转成末尾 user 的“续写指令”
         （模板可用 instruction_template 自定义，留空用内置默认）。
-      两种情况都返回 prefill 文本，由上游把它拼回输出开头（配合去重）。
+    - mode="keep_turn"（3.x 上比 smart 更贴合原意）：
+      **保留** assistant 预填充作为 model 轮次，只在其后补一句极短的 user 推动语。
+      3.x 拒绝的是“以 model 轮次**结尾**”，并不禁止 model 轮次出现在中间。
+      smart 把预填充塞进 user 消息，模型于是把自己写的话当成“用户给的参考文本”，
+      倾向另起一句；keep_turn 让预填充留在模型自己的声音里，续写是逐字接续的。
+      预填充的主要用途是用预设自带的思维链顶掉原生思维链，此时预填充往往是
+      `<thinking>` 这类**未闭合的开头**——它必须处在 model 轮次里，模型才会
+      当作“自己已经写了一半”继续填充，而不是当成用户贴来的样例。
+      2.5 系仍走原生透传，不受影响。
+      以上模式都返回 prefill 文本，由上游把它拼回输出开头（配合去重）。
 
     返回 (处理后的消息列表, 需拼回输出开头的预填充文本, 是否检测到预填充)。
     第三项供“预填充时压制原生思考”等联动逻辑使用。
@@ -214,9 +402,17 @@ def apply_prefill_compat(
         new_msgs.append(OpenAIMessage(role="user", content="(请继续)"))
         return new_msgs, "", True
 
-    # smart + 模型支持 model 结尾 → 原生预填充透传（不改消息，模型直接续写）
+    # 模型支持 model 结尾 → 原生预填充透传（不改消息，模型直接续写）
     if allow_model_last:
         return messages, prefill, True
+
+    if mode == "keep_turn":
+        # 保留预填充所在的 assistant 轮次，只补一句极短 user 推动语。
+        # 必须截到 idx+1：预填充后面可能还跟着空消息，带上它们会再次以非 user 结尾。
+        new_msgs = list(messages[:idx + 1])
+        nudge = (instruction_template or "").strip() or DEFAULT_KEEP_TURN_NUDGE
+        new_msgs.append(OpenAIMessage(role="user", content=nudge))
+        return new_msgs, prefill, True
 
     # smart：丢弃末尾预填充 assistant（及其后的空消息），转成续写指令
     new_msgs = list(messages[:idx])
@@ -269,9 +465,26 @@ class PrefillDeduper:
         if self.done:
             return text
         self.buffer += text
-        if len(self.buffer) < self.window:
-            return ""
-        return self._resolve()
+        # P2-4：只要已经能判定「不可能是预填充的重复」，立刻放行，不必攒满窗口。
+        # 旧实现固定攒到 min(len(prefill)+32, 600) 字符才放行，首 token 延迟明显，
+        # 与注释里的“零额外延迟”不符。
+        if len(self.buffer) >= self.window or not self._still_ambiguous():
+            return self._resolve()
+        return ""
+
+    def _still_ambiguous(self) -> bool:
+        """当前缓冲是否还不足以判定去重量。
+
+        strip_prefill_overlap 只看输出的前 len(prefill) 个字符，因此：
+          - 缓冲长度已达 len(prefill) → 信息完备，重叠量已确定，立即放行；
+          - 否则只有当缓冲仍是预填充的某个子串时，才可能延展成更长的重叠，需要继续等。
+        """
+        buf, pre = self.buffer, self.prefill
+        if not buf or not pre:
+            return False
+        if len(buf) >= len(pre):
+            return False
+        return buf in pre
 
     def flush(self) -> str:
         if self.done:
@@ -283,8 +496,14 @@ class PrefillDeduper:
         return strip_prefill_overlap(self.prefill, out)
 
 
-def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
+def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") -> List[types.Content]:
+    """OpenAI 消息 → Gemini contents。
+
+    model_name 用于判断是否需要对缺失的思考签名启用官方哨兵（仅 Gemini 3.x 强校验）。
+    留空表示“未知模型”，此时不注入哨兵——调用方（express_sdk）总会传真实模型名。
+    """
     print("🔄 [消息转换] 正在将 OpenAI 格式消息转换为 Gemini contents。")
+    require_sig = _requires_signature(model_name)
     raw_gemini_messages = []
     for idx, message in enumerate(messages):
         role = message.role
@@ -307,15 +526,10 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                 # 让标准 OpenAI 客户端的工具往返也能正确工作（修复退化为纯文本的问题）。
                 tool_output_data = _coerce_tool_response(message.content)
 
-                real_tool_id = tool_call_id_str
-                thought_sig_bytes = None
-                if "__thought__" in tool_call_id_str:
-                    parts_id = tool_call_id_str.split("__thought__")
-                    real_tool_id = parts_id[0]
-                    try:
-                        thought_sig_bytes = base64.b64decode(parts_id[1])
-                    except Exception:
-                        thought_sig_bytes = None
+                # 函数**结果**不需要签名（官方只对 functionCall 强校验），因此不注入哨兵；
+                # 但如果能取回签名就照常带上，保持与上游一致。
+                real_tool_id, thought_sig_bytes = resolve_tool_call_signature(
+                    tool_call_id_str, require_signature=False)
 
                 func_resp_kwargs = {"name": message.name, "response": tool_output_data}
                 if real_tool_id:
@@ -346,16 +560,10 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                 except json.JSONDecodeError:
                     parsed_arguments = {}
 
-                # 无论是否带 __thought__ 后缀，都构造规范的 function_call
-                real_tool_id = tool_call_id_str
-                thought_sig_bytes = None
-                if "__thought__" in tool_call_id_str:
-                    parts_id = tool_call_id_str.split("__thought__")
-                    real_tool_id = parts_id[0]
-                    try:
-                        thought_sig_bytes = base64.b64decode(parts_id[1])
-                    except Exception:
-                        thought_sig_bytes = None
+                # 函数**调用**是强校验点：Gemini 3.x 缺签名直接 400，
+                # 因此这里允许降级到官方哨兵，保证请求不会整体失败。
+                real_tool_id, thought_sig_bytes = resolve_tool_call_signature(
+                    tool_call_id_str, require_signature=require_sig)
 
                 fc_kwargs = {"name": function_name, "args": parsed_arguments}
                 if real_tool_id:
@@ -392,83 +600,68 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
 
             elif isinstance(message.content, list):
                 for part_item in message.content:
-                    if isinstance(part_item, dict):
-                        if part_item.get("type") == "text":
-                            text_content = part_item.get("text", "\n")
-                            image_parts, clean_text = _extract_markdown_images_to_parts(text_content)
-                            if clean_text: parts.append(types.Part.from_text(text=clean_text))
-                            parts.extend(image_parts)
+                    # F-1：pydantic 会把标准 part 解析成 ContentPartText / ContentPartImage 实例，
+                    # 归一成 dict 后只保留一条处理路径（原先 dict 与实例两套分支已出现行为分歧：
+                    # 实例分支直接 from_text，跳过了 markdown 内联图片抽取）。
+                    part_item = normalize_content_part(part_item)
+                    if not isinstance(part_item, dict):
+                        text_attr = getattr(part_item, "text", None)
+                        if isinstance(text_attr, str):
+                            parts.append(types.Part.from_text(text=text_attr))
+                        continue
 
-                        elif part_item.get("type") == "image_url":
-                            image_url = part_item.get("image_url", {}).get("url", "")
-                            if image_url.startswith("data:"):
-                                mime_match = re.match(r"data:([^;]+);base64,(.+)", image_url)
-                                if mime_match:
-                                    mime_type, b64_data = mime_match.groups()
-                                    raw_bytes = base64.b64decode(b64_data)
-                                    opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
-                                    parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
-                            elif image_url.startswith("http"):
-                                try:
-                                    def fetch_img():
-                                        client_args = {"timeout": 10.0, "follow_redirects": True}
-                                        if app_config.PROXY_URL:
-                                            client_args["proxy"] = app_config.PROXY_URL
-                                        if getattr(app_config, "SSL_CERT_FILE", None):
-                                            client_args["verify"] = app_config.SSL_CERT_FILE
-                                        with httpx.Client(**client_args) as client:
-                                            resp = client.get(image_url)
-                                            resp.raise_for_status()
-                                            return resp.content, resp.headers.get("content-type", "image/jpeg")
-                                    with concurrent.futures.ThreadPoolExecutor() as pool:
-                                        future = pool.submit(fetch_img)
-                                        img_bytes, mime_type = future.result(timeout=12) 
-                                        opt_bytes, opt_mime = optimize_image_bytes(img_bytes, mime_type)
-                                        parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
-                                except Exception as e:
-                                    print(f"⚠️ [图片处理] 获取远程图片失败，已跳过：{image_url}，原因：{e}")
+                    if part_item.get("type") == "text":
+                        text_content = part_item.get("text", "\n")
+                        image_parts, clean_text = _extract_markdown_images_to_parts(text_content)
+                        if clean_text: parts.append(types.Part.from_text(text=clean_text))
+                        parts.extend(image_parts)
 
-                    elif hasattr(part_item, "type") and getattr(part_item, "type") == "image_url":
-                        img_url_data = part_item.image_url
-                        url_str = getattr(img_url_data, "url", "") if hasattr(img_url_data, "url") else (img_url_data.get("url", "") if isinstance(img_url_data, dict) else "")
-                        
-                        if url_str.startswith("data:"):
-                            mime_match = re.match(r"data:([^;]+);base64,(.+)", url_str)
+                    elif part_item.get("type") == "image_url":
+                        img_url_data = part_item.get("image_url") or {}
+                        if isinstance(img_url_data, dict):
+                            image_url = img_url_data.get("url", "")
+                        else:
+                            image_url = getattr(img_url_data, "url", "") or ""
+
+                        if image_url.startswith("data:"):
+                            mime_match = re.match(r"data:([^;]+);base64,(.+)", image_url)
                             if mime_match:
                                 mime_type, b64_data = mime_match.groups()
                                 raw_bytes = base64.b64decode(b64_data)
                                 opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
                                 parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
-                        elif url_str.startswith("http"):
-                            try:
-                                def fetch_img():
-                                    client_args = {"timeout": 10.0, "follow_redirects": True}
-                                    if app_config.PROXY_URL:
-                                        client_args["proxy"] = app_config.PROXY_URL
-                                    if getattr(app_config, "SSL_CERT_FILE", None):
-                                        client_args["verify"] = app_config.SSL_CERT_FILE
-                                    with httpx.Client(**client_args) as client:
-                                        resp = client.get(url_str)
-                                        resp.raise_for_status()
-                                        return resp.content, resp.headers.get("content-type", "image/jpeg")
-                                with concurrent.futures.ThreadPoolExecutor() as pool:
-                                    future = pool.submit(fetch_img)
-                                    img_bytes, mime_type = future.result(timeout=12) 
-                                    opt_bytes, opt_mime = optimize_image_bytes(img_bytes, mime_type)
-                                    parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
-                            except Exception as e:
-                                print(f"⚠️ [图片处理] 获取远程图片失败，已跳过：{url_str}，原因：{e}")
-                                
-                    elif hasattr(part_item, "text"):
-                        parts.append(types.Part.from_text(text=part_item.text))
+                        elif image_url.startswith(("http://", "https://")):
+                            # 统一走加固后的 fetch_remote_image（SSRF 与体积防护都在那里，见 F-3）。
+                            fetched = fetch_remote_image(image_url)
+                            if fetched:
+                                img_bytes, mime_type = fetched
+                                opt_bytes, opt_mime = optimize_image_bytes(img_bytes, mime_type)
+                                parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
 
         if not parts: continue
         raw_gemini_messages.append(types.Content(role=current_gemini_role, parts=parts))
 
+    def _is_text_only(content: types.Content) -> bool:
+        """该 Content 是否只含文本 part（没有 function_call / function_response / inline_data）。"""
+        for p in content.parts or []:
+            if getattr(p, "function_call", None) is not None:
+                return False
+            if getattr(p, "function_response", None) is not None:
+                return False
+            if getattr(p, "inline_data", None) is not None:
+                return False
+            if getattr(p, "text", None) is None:
+                return False
+        return True
+
     merged_messages = []
     for msg in raw_gemini_messages:
         if merged_messages and merged_messages[-1].role == msg.role:
-            merged_messages[-1].parts.append(types.Part.from_text(text="\n\n"))
+            # 只有两侧都是纯文本时才插入 "\n\n" 分隔符。
+            # 若两个连续 model 轮次都带 function call，插入文本 part 会打断
+            # 官方要求的 FC 连续排列，可能触发 Malformed_Function_Call 或签名校验失败。
+            if _is_text_only(merged_messages[-1]) and _is_text_only(msg):
+                merged_messages[-1].parts.append(types.Part.from_text(text="\n\n"))
             merged_messages[-1].parts.extend(msg.parts)
         else:
             merged_messages.append(msg)
@@ -477,6 +670,177 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
         merged_messages.append(types.Content(role="user", parts=[types.Part.from_text(text="继续")]))
 
     return merged_messages
+
+# F-3：远程图片抓取的防护参数。
+# 本服务常部署在能访问内网/云元数据服务的环境里，而图片 URL 完全由请求方控制，
+# 不加限制等于把代理变成一个任意内网 GET 的跳板（SSRF）。
+MAX_REMOTE_IMAGE_BYTES = 20 * 1024 * 1024   # 单张图上限，防止超大响应打爆内存
+MAX_REMOTE_IMAGE_REDIRECTS = 3
+
+
+def _is_blocked_host(host: str) -> bool:
+    """目标是否指向内网/环回/链路本地等不该被代理访问的地址。
+
+    云元数据服务（169.254.169.254）属于链路本地段，已被 is_link_local 覆盖。
+    主机名先解析再判断，避免用 DNS 指向内网的域名绕过。
+    """
+    import ipaddress
+    import socket
+
+    if not host:
+        return True
+    host = host.strip("[]")
+    candidates = []
+    try:
+        candidates.append(ipaddress.ip_address(host))
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except Exception:
+            return True   # 解析不了就不放行
+        for info in infos:
+            try:
+                candidates.append(ipaddress.ip_address(info[4][0]))
+            except ValueError:
+                continue
+    if not candidates:
+        return True
+    for ip in candidates:
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return True
+    return False
+
+
+def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes, str]]:
+    """同步抓取远程图片，返回 (bytes, mime)。失败返回 None。
+
+    调用方须保证不在事件循环线程里直接调用（Express/Cookie 两条通道都用
+    asyncio.to_thread 包住整个消息转换）。
+
+    F-3 防护：只允许 http/https、拒绝内网与链路本地地址（重定向后逐跳复查）、
+    限制响应体积、校验 content-type。配置了 PROXY_URL 时出站本就经代理，
+    到不了内网，此时跳过地址检查。
+    """
+    from urllib.parse import urlparse
+
+    check_host = not app_config.PROXY_URL
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(f"不支持的 URL 协议：{parsed.scheme or '(空)'}")
+        if check_host and _is_blocked_host(parsed.hostname or ""):
+            raise ValueError("目标地址指向内网/环回/链路本地，已拒绝")
+
+        client_args = {"timeout": timeout, "follow_redirects": False}
+        if app_config.PROXY_URL:
+            client_args["proxy"] = app_config.PROXY_URL
+        if getattr(app_config, "SSL_CERT_FILE", None):
+            client_args["verify"] = app_config.SSL_CERT_FILE
+
+        with httpx.Client(**client_args) as client:
+            current = url
+            for _ in range(MAX_REMOTE_IMAGE_REDIRECTS + 1):
+                resp = client.get(current)
+                if resp.is_redirect:
+                    # 逐跳复查：只校验首个 URL 的话，一个 302 就能把请求带进内网。
+                    current = str(resp.next_request.url) if resp.next_request else ""
+                    nxt = urlparse(current)
+                    if nxt.scheme not in ("http", "https"):
+                        raise ValueError(f"重定向到不支持的协议：{nxt.scheme or '(空)'}")
+                    if check_host and _is_blocked_host(nxt.hostname or ""):
+                        raise ValueError("重定向指向内网/环回/链路本地，已拒绝")
+                    continue
+
+                resp.raise_for_status()
+                mime = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+                if mime and not mime.startswith("image/"):
+                    raise ValueError(f"响应不是图片（content-type={mime}）")
+                data = resp.content
+                if len(data) > MAX_REMOTE_IMAGE_BYTES:
+                    raise ValueError(
+                        f"图片超过 {MAX_REMOTE_IMAGE_BYTES // (1024 * 1024)}MB 上限（{len(data)} 字节）")
+                return data, mime or "image/jpeg"
+            raise ValueError("重定向次数过多")
+    except Exception as e:
+        print(f"⚠️ [图片处理] 获取远程图片失败，已跳过：{url[:120]}，原因：{e}")
+        return None
+
+
+def _wire_image_part(raw_bytes: bytes, mime_type: str) -> Dict[str, Any]:
+    """压缩后转成 batchGraphql 的 inlineData part（camelCase）。"""
+    opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
+    return {"inlineData": {"mimeType": opt_mime,
+                           "data": base64.b64encode(opt_bytes).decode("utf-8")}}
+
+
+def openai_content_to_wire_parts(content: Any) -> List[Dict[str, Any]]:
+    """OpenAI 的 message.content → batchGraphql 的 parts 列表（P1-2）。
+
+    与 Express 通道行为对齐：
+      - 解析正文里的 markdown data-URL 图片（多轮修图时上一张图不会再被当成巨大文本发出）
+      - data: 与 http(s): 两种 image_url 都支持
+      - 统一走 optimize_image_bytes 做输入图压缩（控制台开关对两条通道都生效）
+    """
+    parts: List[Dict[str, Any]] = []
+    if content is None:
+        return parts
+
+    def _add_text_with_inline_images(text: str):
+        if not text:
+            return
+        img_parts, clean_text = _extract_markdown_images_to_parts(text)
+        if clean_text:
+            parts.append({"text": clean_text})
+        for ip in img_parts:
+            blob = getattr(ip, "inline_data", None)
+            if blob is not None and getattr(blob, "data", None):
+                data = blob.data
+                if isinstance(data, bytes):
+                    data = base64.b64encode(data).decode("utf-8")
+                parts.append({"inlineData": {"mimeType": getattr(blob, "mime_type", "image/jpeg"),
+                                             "data": data}})
+
+    if isinstance(content, str):
+        _add_text_with_inline_images(content)
+        return parts
+
+    if isinstance(content, list):
+        for item in content:
+            if hasattr(item, "model_dump"):
+                item = item.model_dump()
+            if isinstance(item, str):
+                _add_text_with_inline_images(item)
+                continue
+            if not isinstance(item, dict):
+                text_attr = getattr(item, "text", None)
+                if isinstance(text_attr, str):
+                    _add_text_with_inline_images(text_attr)
+                continue
+
+            item_type = item.get("type", "")
+            if item_type == "text":
+                _add_text_with_inline_images(item.get("text", ""))
+            elif item_type == "image_url":
+                url = item.get("image_url", {})
+                if isinstance(url, dict):
+                    url = url.get("url", "")
+                if not isinstance(url, str) or not url:
+                    continue
+                if url.startswith("data:"):
+                    m = re.match(r"data:([^;]+);base64,(.+)", url, re.DOTALL)
+                    if m:
+                        mime_type, b64_data = m.groups()
+                        try:
+                            parts.append(_wire_image_part(base64.b64decode(b64_data), mime_type))
+                        except Exception as e:
+                            print(f"⚠️ [图片处理] 解析内联图片失败，已跳过：{e}")
+                elif url.startswith("http"):
+                    fetched = fetch_remote_image(url)
+                    if fetched:
+                        parts.append(_wire_image_part(*fetched))
+    return parts
+
 
 def _create_safety_ratings_html(safety_ratings: list) -> str:
     if not safety_ratings:
@@ -591,32 +955,10 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
                 for part in candidate.content.parts:
                     if hasattr(part, "function_call") and part.function_call is not None: 
                         fc = part.function_call
-                        
-                        real_id = getattr(fc, "id", None)
-                        if not real_id: real_id = getattr(fc, "thought_signature", None)
-                        
-                        thought_sig = getattr(part, "thought_signature", None)
-                        thought_sig_b64 = ""
-                        if thought_sig:
-                            if isinstance(thought_sig, bytes):
-                                thought_sig_b64 = base64.b64encode(thought_sig).decode("utf-8")
-                            elif isinstance(thought_sig, str):
-                                thought_sig_b64 = thought_sig
 
-                        safe_name = fc.name.replace(" ", "_")
-                        rand_num = int(time.time() * 10000 + random.randint(0, 9999))
+                        # 统一走 build_tool_call_id：短 id + 签名进旁路缓存
+                        tool_call_id = build_tool_call_id(fc, part)
 
-                        if real_id:
-                            if thought_sig_b64:
-                                tool_call_id = f"{real_id}__thought__{thought_sig_b64}"
-                            else:
-                                tool_call_id = real_id
-                        else:
-                            if thought_sig_b64:
-                                tool_call_id = f"call_{base_id}_{i}_{safe_name}__thought__{thought_sig_b64}"
-                            else:
-                                tool_call_id = f"call_{base_id}_{i}_{safe_name}_{rand_num}"
-                        
                         if "tool_calls" not in message_payload:
                             message_payload["tool_calls"] = []
                         

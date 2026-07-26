@@ -19,13 +19,21 @@ from typing import Any, Optional, List, Dict, AsyncGenerator
 from fastapi import Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from models import OpenAIRequest
+from models import OpenAIRequest, normalize_content_part
 from upstreams.base import BaseUpstream
 from runtime_state import app_state
 import config as app_config
 import model_capabilities as mc
-from message_processing import apply_prefill_compat, strip_prefill_overlap, PrefillDeduper
+from message_processing import (
+    DEFAULT_IMAGE_PREFILL_NUDGE,
+    apply_console_injection,
+    apply_prefill_compat,
+    strip_prefill_overlap,
+    PrefillDeduper,
+    openai_content_to_wire_parts,
+)
 from logger import stats
+from api_helpers import get_retry_settings
 
 from cookie_auth import (
     build_headers,
@@ -34,10 +42,7 @@ from cookie_auth import (
     STREAM_GENERATE_OPERATION_NAME,
 )
 
-# ========== 重试配置 ==========
-MAX_RETRIES = 10
-RETRY_BACKOFF = [5] * 10  # 每次重试等待秒数
-
+# ========== 重试关键词 ==========
 # 可重试的错误关键词（429 限流类）
 RETRYABLE_KEYWORDS = [
     "resource exhausted",
@@ -78,6 +83,31 @@ _THINKING_RUNAWAY_HINT = (
 _NO_BODY_HINT = (
     "可能被安全策略拦截或接口行为变化；原始响应样本已写入运行日志，可到大盘“运行日志”页查看。"
 )
+
+
+def _prefill_tpl(user_template: str, is_image_model: bool) -> str:
+    """选用续写指令：生图模型在用户未自定义时改用要图片的那句。
+
+    通用模板说的是"从断点处无缝往下写"，生图模型会老老实实继续写**文本**，
+    结果吐出一段字符画而不是图片（实测复现）。用户填了自定义模板则以用户的为准。
+    """
+    tpl = (user_template or "").strip()
+    if tpl:
+        return tpl
+    return DEFAULT_IMAGE_PREFILL_NUDGE if is_image_model else ""
+
+
+def _prefill_log(mode: str, prefill_text: str) -> str:
+    """按模式说明预填充被怎么处理了——三种模式的差别对使用者影响很大。"""
+    n = len(prefill_text)
+    if mode == "keep_turn":
+        return (f"🩹 [预填充兼容] 预填充（{n} 字）保留为 model 轮次，其后补一句续写推动语；"
+                "输出会把它拼回开头。")
+    if mode == "minimal":
+        return ("🩹 [预填充兼容] 仅补占位 user 保证不报错；预填充**不会**拼回输出开头"
+                "（预设的思考开标签可能因此缺失，酒馆正则会抓不到）。")
+    return (f"🩹 [预填充兼容] 预填充（{n} 字）已并入末尾 user 消息作为续写指令，并将拼回输出开头。"
+            "若预填充停在半截词/半截标签且模型接不上，可试试「保留模型轮次」。")
 
 
 def _is_retryable_error(error_msg: str) -> bool:
@@ -141,7 +171,29 @@ def _build_thinking_config(model_name: str, request: OpenAIRequest,
 
 # ========== OpenAI → batchGraphql 消息格式转换 ==========
 
+def has_tool_traffic(messages: list, tools: Any = None) -> bool:
+    """请求里是否含函数调用相关内容（P1-1）。
+
+    Cookie 通道不下发 functionDeclarations，也无法表达 functionCall/functionResponse。
+    旧实现把 role="tool" 一律折成 model 轮次、assistant.tool_calls 直接丢弃，
+    发出去的是一段语义错乱的历史——静默出错比明确报错糟糕得多。
+    """
+    if tools:
+        return True
+    for m in messages or []:
+        if getattr(m, "role", None) == "tool":
+            return True
+        if getattr(m, "tool_calls", None):
+            return True
+    return False
+
+
 def _convert_messages_to_contents(messages: list) -> tuple:
+    """OpenAI messages → batchGraphql contents。
+
+    注意：内部会做远程图片抓取与 PIL 压缩（同步阻塞），
+    调用方须用 asyncio.to_thread 包住（见 chat_completions）。
+    """
     contents = []
     system_parts = []
 
@@ -152,37 +204,18 @@ def _convert_messages_to_contents(messages: list) -> tuple:
         if role == "system":
             if isinstance(content, str):
                 system_parts.append(content)
+            else:
+                # 分段 system 也要收下，否则酒馆预设的多段 system 会被整段丢弃。
+                # F-1：必须先归一，pydantic 已把标准 text part 变成 ContentPartText 实例。
+                for p in (content or []):
+                    p = normalize_content_part(p)
+                    if isinstance(p, dict) and p.get("type") == "text":
+                        system_parts.append(p.get("text", ""))
             continue
 
+        # 已在入口用 has_tool_traffic() 拒绝了工具流量，这里只可能是 user / assistant
         gemini_role = "user" if role == "user" else "model"
-
-        parts = []
-        if isinstance(content, str):
-            parts.append({"text": content})
-        elif isinstance(content, list):
-            for item in content:
-                if hasattr(item, 'model_dump'):
-                    item = item.model_dump()
-
-                if isinstance(item, dict):
-                    item_type = item.get("type", "")
-                    if item_type == "text":
-                        parts.append({"text": item.get("text", "")})
-                    elif item_type == "image_url":
-                        url = item.get("image_url", {})
-                        if isinstance(url, dict):
-                            url = url.get("url", "")
-                        if url.startswith("data:"):
-                            try:
-                                header, encoded = url.split(",", 1)
-                                mime_type = header.split(":")[1].split(";")[0]
-                                parts.append({
-                                    "inlineData": {"mimeType": mime_type, "data": encoded}
-                                })
-                            except Exception:
-                                parts.append({"text": "[图片解析失败]"})
-                elif isinstance(item, str):
-                    parts.append({"text": item})
+        parts = openai_content_to_wire_parts(content)
 
         if parts:
             contents.append({"role": gemini_role, "parts": parts})
@@ -197,8 +230,16 @@ def _convert_messages_to_contents(messages: list) -> tuple:
         else:
             merged.append(c)
 
-    system_text = "\n".join(system_parts) if system_parts else None
+    system_text = "\n".join(t for t in system_parts if t) if system_parts else None
     return merged, system_text
+
+
+async def build_batch_graphql_body_async(project_id: str, model_name: str,
+                                         request: OpenAIRequest,
+                                         prefill_active: bool = False) -> dict:
+    """在线程里构建请求体：内部有远程图片下载与 PIL 压缩，不能阻塞事件循环（P1-2）。"""
+    return await asyncio.to_thread(_build_batch_graphql_body, project_id, model_name,
+                                   request, prefill_active)
 
 
 def _build_batch_graphql_body(
@@ -630,7 +671,8 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
         if await fastapi_request.is_disconnected():
             return {"kind": "error", "message": "客户端已断开连接。"}
         try:
-            body = _build_batch_graphql_body(project_id, base_model_name, request_obj)
+            body = await build_batch_graphql_body_async(
+                project_id, base_model_name, request_obj)
             req_headers = build_headers(_get_cookie_string()) or headers
             async with httpx.AsyncClient(**client_kwargs) as client:
                 response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body)
@@ -734,6 +776,16 @@ class CookieProxyUpstream(BaseUpstream):
                 "请确保 Cookie 来自已登录的 console.cloud.google.com 页面。"
             ), "type": "auth_error"}})
 
+        # ===== 2.5 拒绝该通道无法表达的工具流量（P1-1）=====
+        if has_tool_traffic(request_obj.messages, request_obj.tools):
+            print("⛔ [Studio] 请求含函数调用内容，Cookie 直连通道不支持，已明确拒绝。")
+            return JSONResponse(status_code=400, content={"error": {
+                "message": ("Cookie 直连通道暂不支持函数调用（不下发 functionDeclarations，"
+                            "也无法表达 functionCall / functionResponse）。\n"
+                            "请在控制台切换到「标准模式（Express API Key）」后重试。"),
+                "type": "unsupported_feature",
+            }})
+
         # ===== 3. 解析模型名 =====
         model_display = request_obj.model
         base_model_name = model_display
@@ -744,19 +796,40 @@ class CookieProxyUpstream(BaseUpstream):
         _profile = mc.get_profile(base_model_name)
         prefill_text = ""
         prefill_active = False
-        _prefill_mode = app_state.get_setting("prefill_mode", "smart")
+        # 控制台注入（轻量前端用；两个字段都留空时是空操作）。
+        # 本通道入口已拒绝工具流量，故 has_tools 恒为 False。
+        _inj_settings = app_state.get_effective_settings(base_model_name)
+        _injected, _inj_notes = apply_console_injection(
+            request_obj.messages,
+            system_text=_inj_settings.get("inject_system_instruction", ""),
+            prefill_text=_inj_settings.get("inject_prefill", ""),
+            has_tools=False,
+            is_image_model=_profile["is_image"],
+            allow_image_prefill=bool(_inj_settings.get("inject_prefill_for_image", False)),
+        )
+        for _n in _inj_notes:
+            print(_n)
+        if _injected is not request_obj.messages:
+            request_obj = request_obj.model_copy(update={"messages": _injected})
+
+        _prefill_mode = app_state.get_setting("prefill_mode", app_config.DEFAULT_SETTINGS["prefill_mode"])
         if _prefill_mode != "off":
             _new_msgs, prefill_text, prefill_active = apply_prefill_compat(
                 request_obj.messages, _prefill_mode,
                 allow_model_last=not _profile["requires_user_last_turn"],
-                instruction_template=app_state.get_setting("prefill_instruction", ""),
+                instruction_template=_prefill_tpl(app_state.get_setting("prefill_instruction", ""), _profile["is_image"]),
             )
             if _new_msgs is not request_obj.messages:
                 request_obj = request_obj.model_copy(update={"messages": _new_msgs})
-                if prefill_text:
-                    print(f"🩹 [预填充兼容] 已将末尾 assistant 预填充转为续写指令（{len(prefill_text)} 字），并将拼回输出开头。")
+                print(_prefill_log(_prefill_mode, prefill_text))
             elif prefill_text:
                 print(f"🩹 [预填充兼容] 该模型支持 model 结尾，预填充原生透传（{len(prefill_text)} 字），模型将直接续写。")
+            else:
+                # 没检测到预填充也要说一声：很多人以为整个预设就是预填充，
+                # 实际只有「最后一条 assistant 消息」才算。没有它，压制原生思考也不会触发。
+                print("ℹ️ [预填充兼容] 未检测到预填充（请求最后一条不是 assistant 消息）。"
+                      "预设里的思维链指令属于 system/user 条目，不是预填充；"
+                      "若要用预设思维链顶掉原生思考，需在预设末尾放一条 assistant 条目（通常是思考块的开标签）。")
             if prefill_active and app_state.get_setting("prefill_suppress_thinking", True):
                 print("🧠 [预填充兼容] 已按模型压制原生思考（可在控制台关闭），让预设思维链接管。")
 
@@ -768,21 +841,15 @@ class CookieProxyUpstream(BaseUpstream):
         if app_config.PROXY_URL:
             client_kwargs["proxy"] = app_config.PROXY_URL
 
-        # 重试配置（控制台可调）
-        try:
-            retry_max = int(app_state.get_setting("retry_max", MAX_RETRIES))
-        except (TypeError, ValueError):
-            retry_max = MAX_RETRIES
-        try:
-            backoff_sec = float(app_state.get_setting("retry_backoff_seconds", RETRY_BACKOFF[0]))
-        except (TypeError, ValueError):
-            backoff_sec = float(RETRY_BACKOFF[0])
+        # 重试配置（控制台可调）；语义与 Express 通道统一：总尝试次数 = retry_max + 1
+        retry_max, backoff_sec = get_retry_settings()
 
         is_stream = request_obj.stream
         response_id = f"chatcmpl-studio-{int(time.time())}"
         start_time = time.time()
         want_usage = _wants_usage(request_obj)
-        cookie_debug = bool(app_state.get_setting("cookie_debug", False))
+        cookie_debug = bool(app_state.get_setting("debug_outbound", False)
+                            or app_state.get_setting("cookie_debug", False))
 
         # batchGraphql(Studio) 会忽略 includeThoughts=false（真机验证），因此当解析出的思考配置
         # 要求不回传思考时，由本通道在响应侧主动剥离思考块。生图无思考，strip 恒 False。
@@ -848,8 +915,8 @@ class CookieProxyUpstream(BaseUpstream):
                         print("ℹ️ [Studio] 客户端已断开连接，停止流式重试。")
                         return
 
-                    body = _build_batch_graphql_body(project_id, base_model_name, request_obj,
-                                                     prefill_active=prefill_active)
+                    body = await build_batch_graphql_body_async(
+                        project_id, base_model_name, request_obj, prefill_active=prefill_active)
                     req_headers = build_headers(_get_cookie_string()) or headers
                     if cookie_debug:
                         print(f"🔎 [Studio 调试] 出站 generationConfig: "
@@ -1011,8 +1078,8 @@ class CookieProxyUpstream(BaseUpstream):
                         "error": {"message": "客户端已断开连接，请求已取消。", "type": "client_closed_request"}
                     })
                 try:
-                    body = _build_batch_graphql_body(project_id, base_model_name, request_obj,
-                                                     prefill_active=prefill_active)
+                    body = await build_batch_graphql_body_async(
+                        project_id, base_model_name, request_obj, prefill_active=prefill_active)
                     req_headers = build_headers(_get_cookie_string()) or headers
                     if cookie_debug:
                         print(f"🔎 [Studio 调试] 出站 generationConfig: "
