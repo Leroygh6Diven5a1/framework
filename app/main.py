@@ -367,12 +367,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
         <div id="caps-summary" class="text-xs text-neutral-600 flex flex-wrap gap-2 max-w-xl"></div>
       </div>
-      <p class="text-xs text-neutral-500 mt-3">下方参数默认为<b>全局默认值</b>（对所有模型生效）。可为<b>当前所选模型</b>单独保存专属值：<b>思考、生图、采样默认</b>这三类支持按模型覆盖。优先级：<b>单次请求 &gt; 模型专属 &gt; 全局默认 &gt; 内置</b>，最后仍按模型能力自动裁剪。</p>
+      <p class="text-xs text-neutral-500 mt-3 leading-relaxed">页面分两段：<b>① 按模型参数</b>（思考 / 生图 / 采样 / 注入与续写）既可作全局默认，也可只对上面选中的模型生效；<b>② 全局设置</b>（图压缩 / 重试 / 假流式 / 调试开关等）只有全局一份。<br>
+      <b>两个按钮的区别</b>：本卡片的「保存为该模型专属」只保存 ① 区、且只对<b>当前所选模型</b>生效（模型名后会出现 ★）；页面底部的「保存全局设置」保存整页、作为<b>所有模型</b>的默认值。<br>
+      优先级：<b>单次请求 &gt; 模型专属 &gt; 全局默认 &gt; 内置</b>，最后仍按模型能力自动裁剪。</p>
       <div class="flex items-center gap-2 mt-3 flex-wrap">
         <button class="btn px-4 py-2 text-sm" onclick="saveModelOverride()">💾 保存为该模型专属</button>
         <button class="px-4 py-2 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="clearModelOverride()">清除该模型专属</button>
         <span id="ov-hint" class="text-xs text-neutral-500"></span>
       </div>
+    </div>
+
+    <div class="flex items-center gap-2 mb-2 mt-5">
+      <span class="pill pill-accent" style="text-transform:none">① 按模型参数</span>
+      <span class="text-xs text-neutral-500">下面这些卡片里的项，都可以用上方「保存为该模型专属」只对所选模型生效；点「保存全局设置」则作为所有模型的默认值。</span>
     </div>
 
     <div class="grid md:grid-cols-2 gap-4">
@@ -411,6 +418,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <select id="image_aspect_ratio" class="inp"></select>
         </div>
         <p id="image-note" class="text-xs text-neutral-500 mt-2"></p>
+        <div class="space-y-3 mt-3 pt-3 border-t border-neutral-100">
+          <div class="text-xs text-neutral-400">以下两项仅对生图模型有意义，可按模型专属保存</div>
+          <div>
+            <div class="flex items-center justify-between"><span class="text-sm">生图下发 system 指令<span class="helpq" onclick="hlp(this,'h_isi')">?</span></span><label class="switch"><input type="checkbox" id="image_system_instruction"><span class="slider"></span></label></div>
+            <div id="h_isi" class="helpbox">关闭时（默认）生图模型会<b>丢弃 system 提示词</b>——你写的画风、构图要求全部不生效。开启后 system 会随生图请求一起下发。<br>实测对照（system=“纯黑白线稿，只有线条”，user=“画一只猫”）：<b>关 → 彩色写实照片；开 → 黑白线稿</b>。默认关只是为了不改变旧行为，<b>用生图建议打开</b>。</div>
+          </div>
+          <div>
+            <div class="flex items-center justify-between"><span class="text-sm">生图也注入预填充<span class="helpq" onclick="hlp(this,'h_ipf')">?</span></span><label class="switch"><input type="checkbox" id="inject_prefill_for_image"><span class="slider"></span></label></div>
+            <div id="h_ipf" class="helpbox">默认关：下面“注入预填充”的内容<b>不会</b>发给生图模型。<br>预填充对生图其实有<b>很强的引导力</b>——实测同一句“画一只猫”，预填充承诺“纯黑白钢笔线稿”就真的输出线稿，不加则是彩色写实照片。想用它引导画风或做破限，就打开。<br><b>注意</b>：角色扮演用的预填充（例如思考块开标签）落到生图请求上，可能让模型改吐一段文字而不出图。建议配合“保存为该模型专属”，给生图模型单独配一段合适的预填充。<br>生图模型会自动改用一句<b>要图片</b>的续写指令（否则模型会把“继续往下写”理解成继续写文字，实测会吐字符画）；若你在下面自定义了“续写指令模板”，则以你的为准——生图用时记得写明“直接输出图片”。</div>
+          </div>
+        </div>
       </div>
 
       <!-- 采样默认 -->
@@ -424,6 +442,43 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <p id="sampling-note" class="text-xs text-neutral-500 mt-2"></p>
       </div>
 
+      <!-- 控制台注入（可按模型覆盖） -->
+      <div class="card p-5">
+        <div class="text-sm font-semibold mb-3">注入与续写 <span class="text-xs font-normal text-neutral-400">（留空＝不启用 / 用内置默认；均支持按模型专属）</span></div>
+        <div class="space-y-3">
+
+          <div>
+            <div class="lbl mb-1">附加 system 指令<span class="helpq" onclick="hlp(this,'h_injs')">?</span></div>
+            <textarea id="inject_system_instruction" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
+            <div id="h_injs" class="helpbox">追加到客户端 system 之<b>后</b>，两条通道都生效。<br>给 <b>RikkaHub 这类轻量前端</b>用：它们没有酒馆的预设系统，每开一个新对话都要重设系统提示。填在这里就是<b>所有前端、所有对话通用</b>。<br><b>酒馆用户请留空</b>——预设已经管了 system，这里再加会和预设打架，而且 <code>{{getvar::xx}}</code> 这类宏在代理侧<b>不会被解析</b>。</div>
+          </div>
+          <div>
+            <div class="lbl mb-1">注入预填充<span class="helpq" onclick="hlp(this,'h_injp')">?</span></div>
+            <textarea id="inject_prefill" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
+            <div id="h_injp" class="helpbox">
+              客户端<b>没有发送</b>预填充时，代理自动补一条 assistant 消息，然后按上面的“预填充兼容模式”处理。<br>
+              轻量前端<b>从不发送预填充</b>，等于完全用不上破限最强的那个杠杆，连“预填充时压制原生思考”也永远不会触发（3.6-flash 上更容易出现“只有思考没正文”）。填在这里就能补上。<br>
+              内容通常很短：一句开场白 + 思考块的开标签即可，别塞大段规则（规则请放上面的 system 框）。<br>
+              <b>四条护栏，避免和现有功能冲突</b>：① 客户端已自带预填充（酒馆）→ 跳过，不覆盖；② 请求带函数调用 → 跳过；③ 生图模型 → 默认跳过（可用上面的“生图也注入预填充”放行）；④ 留空 → 完全不启用。<br>
+              <b>只填内容还不够</b>：填完必须点保存——点“保存全局设置”＝对所有模型生效；点上方“保存为该模型专属”＝只对当前所选模型生效。（生图模型还需额外打开上面的“生图也注入预填充”开关，那个开关只是放行，内容仍取自这里。）<br>强烈建议按模型分开配：生图要的是画风描述，角色扮演要的是思考块开标签，两者内容完全不同；问答用的模型则应留空（否则每条回复开头都会多出这段文字，原生思考也会被压制、影响答题深度）。
+            </div>
+          </div>
+          <div>
+            <div class="lbl mb-1">续写指令模板<span class="helpq" onclick="hlp(this,'h_pfi')">?</span></div>
+            <textarea id="prefill_instruction" rows="2" class="inp log" placeholder="留空 = 使用内置默认"></textarea>
+            <div id="h_pfi" class="helpbox">留空即用内置默认，一般不用改。<br><b>「智能」模式</b>下它是那句续写指令，预填充文本会附在它后面；<b>「保留模型轮次」模式</b>下它就是末尾那句推动语。<br>若「保留模型轮次」老是重复开标签，可以把这里改得更短更像催促（例如只填 <code>继续</code>），减少“新一轮”的暗示。<br><b>与生图的关系</b>：留空时，生图模型会自动换用一句“直接输出图片”的指令；<b>一旦你在这里填了内容，生图模型也会用你填的这句</b>——若那句写的是“接着往下写”，生图会吐字符画而不是图片。所以给生图模型请用<b>“保存为该模型专属”</b>单独配一句（例如“直接输出图片，不要任何文字”），别让文本模型的模板串过去。</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="flex items-center gap-2 mb-2 mt-6">
+      <span class="pill" style="text-transform:none;background:#f1f1f5;color:#52525b">② 全局设置</span>
+      <span class="text-xs text-neutral-500">对所有模型统一生效，<b>不支持</b>按模型专属；改动后请点页面底部「保存全局设置」。</span>
+    </div>
+
+    <div class="grid md:grid-cols-2 gap-4">
       <!-- 输入图压缩 -->
       <div class="card p-5">
         <div class="flex items-center justify-between mb-3">
@@ -462,15 +517,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <div class="flex items-center justify-between"><span class="text-sm">Cookie 通道额外诊断<span class="helpq" onclick="hlp(this,'h_ckd')">?</span></span><label class="switch"><input type="checkbox" id="cookie_debug"><span class="slider"></span></label></div>
             <div id="h_ckd" class="helpbox">仅对 Cookie 直连通道生效，打印出站 <code>generationConfig</code>。<b>无正文时的原始响应样本总是会自动记录，不需要开这个</b>。</div>
           </div>
-          <div>
-            <div class="flex items-center justify-between"><span class="text-sm">生图下发 system 指令<span class="helpq" onclick="hlp(this,'h_isi')">?</span></span><label class="switch"><input type="checkbox" id="image_system_instruction"><span class="slider"></span></label></div>
-            <div id="h_isi" class="helpbox">关闭时（默认）生图模型会<b>丢弃 system 提示词</b>——你写的画风、构图要求全部不生效。开启后 system 会随生图请求一起下发。<br>实测对照（system=“纯黑白线稿，只有线条”，user=“画一只猫”）：<b>关 → 彩色写实照片；开 → 黑白线稿</b>。默认关只是为了不改变旧行为，<b>用生图建议打开</b>。</div>
-          </div>
 
-          <div>
-            <div class="flex items-center justify-between"><span class="text-sm">生图也注入预填充<span class="helpq" onclick="hlp(this,'h_ipf')">?</span></span><label class="switch"><input type="checkbox" id="inject_prefill_for_image"><span class="slider"></span></label></div>
-            <div id="h_ipf" class="helpbox">默认关：下面“注入预填充”的内容<b>不会</b>发给生图模型。<br>预填充对生图其实有<b>很强的引导力</b>——实测同一句“画一只猫”，预填充承诺“纯黑白钢笔线稿”就真的输出线稿，不加则是彩色写实照片。想用它引导画风或做破限，就打开。<br><b>注意</b>：角色扮演用的预填充（例如思考块开标签）落到生图请求上，可能让模型改吐一段文字而不出图。建议配合“保存为该模型专属”，给生图模型单独配一段合适的预填充。<br>生图模型会自动改用一句<b>要图片</b>的续写指令（否则模型会把“继续往下写”理解成继续写文字，实测会吐字符画）；若你在下面自定义了“续写指令模板”，则以你的为准——生图用时记得写明“直接输出图片”。</div>
-          </div>
 
           <div class="pt-1 border-t border-neutral-100"></div>
           <div class="text-xs font-semibold text-neutral-500 pt-1">预填充</div>
@@ -493,37 +540,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <div class="flex items-center justify-between"><span class="text-sm">预填充时压制原生思考<span class="helpq" onclick="hlp(this,'h_pst')">?</span></span><label class="switch"><input type="checkbox" id="prefill_suppress_thinking"><span class="slider"></span></label></div>
             <div id="h_pst" class="helpbox">检测到预填充时，把模型的<b>原生思维链压到最低并不回传</b>，让预设自带的思维链接管（写作效果通常更好，也避免“只有思考没有正文”）。<br>3.x 压到最低档（无法完全关闭），2.5-flash 预算 0 全关，2.5-pro 降到 128。<br><b>只在请求真的带预填充时才触发</b>；若你的预设把思维链写在 system 里、没有 assistant 条目，请改用上方“思考强度”卡片的“关闭原生思考”。</div>
           </div>
-          <div>
-            <div class="lbl mb-1">续写指令模板<span class="helpq" onclick="hlp(this,'h_pfi')">?</span></div>
-            <textarea id="prefill_instruction" rows="2" class="inp log" placeholder="留空 = 使用内置默认"></textarea>
-            <div id="h_pfi" class="helpbox">留空即用内置默认，一般不用改。<br><b>「智能」模式</b>下它是那句续写指令，预填充文本会附在它后面；<b>「保留模型轮次」模式</b>下它就是末尾那句推动语。<br>若「保留模型轮次」老是重复开标签，可以把这里改得更短更像催促（例如只填 <code>继续</code>），减少“新一轮”的暗示。</div>
-          </div>
 
-          <div class="pt-1 border-t border-neutral-100"></div>
-          <div class="text-xs font-semibold text-neutral-500 pt-1">控制台注入 <span class="text-neutral-400 font-normal">（留空＝不启用）</span></div>
-
-          <div>
-            <div class="lbl mb-1">附加 system 指令<span class="helpq" onclick="hlp(this,'h_injs')">?</span></div>
-            <textarea id="inject_system_instruction" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
-            <div id="h_injs" class="helpbox">追加到客户端 system 之<b>后</b>，两条通道都生效。<br>给 <b>RikkaHub 这类轻量前端</b>用：它们没有酒馆的预设系统，每开一个新对话都要重设系统提示。填在这里就是<b>所有前端、所有对话通用</b>。<br><b>酒馆用户请留空</b>——预设已经管了 system，这里再加会和预设打架，而且 <code>{{getvar::xx}}</code> 这类宏在代理侧<b>不会被解析</b>。</div>
-          </div>
-          <div>
-            <div class="lbl mb-1">注入预填充<span class="helpq" onclick="hlp(this,'h_injp')">?</span></div>
-            <textarea id="inject_prefill" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
-            <div id="h_injp" class="helpbox">
-              客户端<b>没有发送</b>预填充时，代理自动补一条 assistant 消息，然后按上面的“预填充兼容模式”处理。<br>
-              轻量前端<b>从不发送预填充</b>，等于完全用不上破限最强的那个杠杆，连“预填充时压制原生思考”也永远不会触发（3.6-flash 上更容易出现“只有思考没正文”）。填在这里就能补上。<br>
-              内容通常很短：一句开场白 + 思考块的开标签即可，别塞大段规则（规则请放上面的 system 框）。<br>
-              <b>四条护栏，避免和现有功能冲突</b>：① 客户端已自带预填充（酒馆）→ 跳过，不覆盖；② 请求带函数调用 → 跳过；③ 生图模型 → 默认跳过（可用上面的“生图也注入预填充”放行）；④ 留空 → 完全不启用。<br>
-              建议配合右上角<b>“保存为该模型专属”</b>：只给跑角色扮演的模型开，问答模型保持干净（否则每条回复开头都会多出这段文字，而且原生思考会被压制、影响答题深度）。
-            </div>
-          </div>
         </div>
       </div>
     </div>
 
     <div class="flex items-center justify-end gap-3 mt-4">
-      <span class="text-xs text-neutral-500">此按钮保存<b>全局默认 + 基础设施项</b>，不影响已设专属参数的模型</span>
+      <span class="text-xs text-neutral-500">保存<b>整页</b>作为所有模型的默认值；已设 ★ 专属的模型仍以自己的专属值为准</span>
       <button class="btn px-5 py-2.5 text-sm" onclick="saveSettings()">保存全局设置</button>
     </div>
   </section>
@@ -545,7 +568,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let CAPS = {}, chart = null, curAR = "";
 let GLOBAL_SETTINGS = {}, OVERRIDES = {};
-const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens'];
+const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image'];
 const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1800); }
@@ -664,6 +687,11 @@ async function saveModelOverride(){
     default_temperature:numOrNull('default_temperature'),
     default_top_p:numOrNull('default_top_p'),
     default_max_tokens:numOrNull('default_max_tokens'),
+    inject_system_instruction:$('inject_system_instruction').value,
+    inject_prefill:$('inject_prefill').value,
+    prefill_instruction:$('prefill_instruction').value,
+    image_system_instruction:$('image_system_instruction').checked,
+    inject_prefill_for_image:$('inject_prefill_for_image').checked,
   };
   try{
     const r=await fetch('/api/model-overrides/'+encodeURIComponent(m),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
